@@ -1,0 +1,11 @@
+node_modules/
+
+# pi session state
+.pi/
+
+# editors / tooling / build output
+.idea/
+.vscode/
+*.tsbuildinfo
+build/
+coverage/
