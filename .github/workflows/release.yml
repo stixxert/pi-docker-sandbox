@@ -12,8 +12,11 @@ on:
 
 # GITHUB_TOKEN is read-only by default; semantic-release needs write access
 # to push the release tag and create the GitHub Release.
+# id-token: write lets GitHub mint a short-lived OIDC token that npm verifies
+# against the package's trusted publisher config — no NPM_TOKEN secret needed.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -29,8 +32,10 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
+          # Do NOT set registry-url here: setup-node would write an .npmrc
+          # that can interfere with OIDC-based trusted publishing.
 
       - name: Install dependencies
         run: npm ci
@@ -38,8 +43,13 @@ jobs:
       - name: Test
         run: npm test
 
+      # Trusted publishing requires npm >= 11.5.1. Node 24 bundles npm 11.x,
+      # but pin to latest so the requirement holds regardless of the exact
+      # Node patch version setup-node installs.
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest
+
       - name: Release
         run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

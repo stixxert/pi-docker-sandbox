@@ -287,11 +287,19 @@ and publishes to npm — only when there is something releasable.
 | `BREAKING CHANGE: ...` (in body or footer) | major (`1.0.0` → `2.0.0`) |
 | anything else (`docs:`, `chore:`, `refactor:`, …) | no release |
 
-One-time setup: add an npm **automation token** (npmjs.com → Access Tokens,
-scope: publish) as the `NPM_TOKEN` secret in GitHub → repo → Settings →
-Secrets and variables → Actions. `GITHUB_TOKEN` needs no setup. The first
-push to `main` containing a `fix:`/`feat:` commit publishes the initial
-version.
+One-time setup: configure **trusted publishing** on npm so the workflow can
+publish via OIDC — no npm token stored anywhere. On npmjs.com → package
+`@stixxert/pi-docker-sandbox` → Settings → **Trusted Publisher**, add:
+
+- Organization or user: `stixxert`
+- Repository: `pi-docker-sandbox`
+- Workflow filename: `release.yml`
+- Environment name: *(leave empty)*
+- Allowed actions: `npm publish`
+
+`GITHUB_TOKEN` needs no setup. The first push to `main` containing a
+`fix:`/`feat:` commit publishes the initial version. Provenance attestations
+are generated automatically with trusted publishing.
 
 ## License
 
