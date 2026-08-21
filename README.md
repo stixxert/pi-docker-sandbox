@@ -272,6 +272,27 @@ directly by pi (copy it to `~/.pi/agent/extensions/docker-sandbox.ts`, or
 pi package manifest (`pi.extensions`) and declares typecheck-only dev deps;
 `tsconfig.json` keeps `tsc --strict` honest against the pi SDK types.
 
+## Releases (CI/CD)
+
+Releases are fully automated with [semantic-release](https://semantic-release.gitbook.io/)
+via GitHub Actions (`.github/workflows/release.yml`). The **commit messages
+themselves signal the release**: push to `main` and CI analyzes commits since
+the last release tag, then bumps the version, tags, creates a GitHub Release,
+and publishes to npm — only when there is something releasable.
+
+| Commit message | Version bump |
+|---|---|
+| `fix: ...` | patch (`1.0.0` → `1.0.1`) |
+| `feat: ...` | minor (`1.0.0` → `1.1.0`) |
+| `BREAKING CHANGE: ...` (in body or footer) | major (`1.0.0` → `2.0.0`) |
+| anything else (`docs:`, `chore:`, `refactor:`, …) | no release |
+
+One-time setup: add an npm **automation token** (npmjs.com → Access Tokens,
+scope: publish) as the `NPM_TOKEN` secret in GitHub → repo → Settings →
+Secrets and variables → Actions. `GITHUB_TOKEN` needs no setup. The first
+push to `main` containing a `fix:`/`feat:` commit publishes the initial
+version.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).

@@ -10,16 +10,27 @@
     "type": "git",
     "url": "git+https://github.com/stixxert/pi-docker-sandbox.git"
   },
-  "files": ["index.ts", "README.md", "boundary.md", "security.md", "LICENSE"],
-  "keywords": ["pi-package"],
+  "files": [
+    "index.ts",
+    "README.md",
+    "boundary.md",
+    "security.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node smoke-test.mjs",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "prepublishOnly": "npm run typecheck && npm test",
+    "release": "semantic-release"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -29,6 +40,7 @@
     "@earendil-works/pi-ai": "^0.84.1",
     "@earendil-works/pi-coding-agent": "^0.84.1",
     "@types/node": "^24.0.0",
+    "semantic-release": "^25.0.9",
     "typescript": "^5.9.0"
   }
 }
