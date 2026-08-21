@@ -5,6 +5,8 @@
  * Run: node smoke-test.mjs
  */
 import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
 const require = createRequire(import.meta.url);
 
 // Node 24 strips types; import the .ts source directly.
@@ -171,6 +173,143 @@ const SECRETS = ["API_KEY", "DB_URL", "WEIRD", "DOCKER_HOST", "DOCKER_CONTEXT", 
 	const first = withEnv({}, () => mod.sessionSandboxName());
 	if (again !== first) throw new Error(`derived name regenerated after override was removed: ${first} -> ${again}`);
 	console.log(`  derived name stable across override toggles`);
+}
+
+/* ------------------------------------------------------------------ */
+/* Path confinement (workspace escape must be rejected)                */
+/* ------------------------------------------------------------------ */
+
+{
+	const cwd = process.cwd();
+	const within = (p) => {
+		const r = mod.mapHostPath(p);
+		if (r !== cwd && !r.startsWith(cwd + "/")) throw new Error(`mapHostPath(${p}) escaped the workspace: ${r}`);
+		return r;
+	};
+	const rejects = (p) => {
+		let threw = false;
+		try {
+			mod.mapHostPath(p);
+		} catch (e) {
+			threw = /escapes the workspace/.test(e.message);
+		}
+		if (!threw) throw new Error(`mapHostPath(${p}) should have been rejected`);
+	};
+	within("/workspace/app");
+	within("/workspace");
+	within("app");
+	within("/workspace/app/sub");
+	rejects("/workspace/../../etc/passwd");
+	rejects("/workspace/../../../Users/me/.ssh/id_rsa");
+	rejects("/etc/passwd");
+	rejects("../../etc/shadow");
+	rejects("/workspace/../sibling");
+	console.log("  path confinement: /workspace + relative paths map into the workspace; traversal + absolute host paths rejected");
+}
+
+/* ------------------------------------------------------------------ */
+/* Tool guards (empty command, rm+detach conflict)                     */
+/* ------------------------------------------------------------------ */
+
+{
+	const execTool = tools.find((t) => t.name === "docker_exec");
+	let threw = false;
+	try {
+		await execTool.execute("id", { id: "foo" }, undefined, undefined, {});
+	} catch (e) {
+		threw = e.message === "docker exec: empty command";
+	}
+	if (!threw) throw new Error("docker_exec with no command should throw a clean error, not crash");
+
+	const runTool = tools.find((t) => t.name === "docker_run");
+	threw = false;
+	try {
+		await runTool.execute("id", { image: "x", rm: true }, undefined, undefined, {});
+	} catch (e) {
+		threw = /--rm cannot be combined/.test(e.message);
+	}
+	if (!threw) throw new Error("docker_run rm+detach should throw a clean error");
+	console.log("  tool guards: docker_exec empty command and docker_run rm+detach rejected cleanly");
+}
+
+/* ------------------------------------------------------------------ */
+/* Argument safety (flag injection + control chars)                    */
+/* ------------------------------------------------------------------ */
+
+{
+	const ok = (v) => mod.assertSafeArg(v, "test"); // must not throw
+	const bad = (v) => {
+		let threw = false;
+		try {
+			mod.assertSafeArg(v, "test");
+		} catch (e) {
+			threw = /invalid test/.test(e.message);
+		}
+		if (!threw) throw new Error(`assertSafeArg(${JSON.stringify(v)}) should have been rejected`);
+	};
+	ok("nginx:1.27");
+	ok("myapp");
+	ok("abc123");
+	bad("-x");
+	bad("--privileged");
+	bad("");
+	bad("a\nb");
+	bad("a\rb");
+	bad("a\x00b");
+	console.log("  assertSafeArg: rejects empty, \"-\"-prefixed, and control-char values");
+}
+
+/* ------------------------------------------------------------------ */
+/* Symlink confinement (workspace symlink pointing outside)            */
+/* ------------------------------------------------------------------ */
+
+{
+	const link = path.join(process.cwd(), "__pi_sbx_test_link__");
+	try {
+		fs.symlinkSync("/etc", link);
+		let threw = false;
+		try {
+			mod.mapHostPath("/workspace/__pi_sbx_test_link__");
+		} catch (e) {
+			threw = /symlink/.test(e.message);
+		}
+		if (!threw) throw new Error("mapHostPath should reject a workspace symlink pointing outside");
+	} finally {
+		fs.rmSync(link, { force: true });
+	}
+	console.log("  symlink confinement: a workspace symlink pointing outside is rejected");
+}
+
+/* ------------------------------------------------------------------ */
+/* docker_run / docker_exec input validation                           */
+/* ------------------------------------------------------------------ */
+
+{
+	const runTool = tools.find((t) => t.name === "docker_run");
+	const rejects = async (params, re) => {
+		let threw = false;
+		try {
+			await runTool.execute("id", params, undefined, undefined, {});
+		} catch (e) {
+			threw = re.test(e.message);
+		}
+		if (!threw) throw new Error(`docker_run(${JSON.stringify(params)}) should have been rejected`);
+	};
+	await rejects({ image: "x", name: "--privileged" }, /invalid container name/);
+	await rejects({ image: "x", ports: ["127.0.0.1:8080:80"] }, /bad port spec/);
+	await rejects({ image: "x", volumes: ["/workspace/app"] }, /bad volume spec/);
+	await rejects({ image: "x", memory: "1.5.5g" }, /bad memory limit/);
+	await rejects({ image: "-x" }, /invalid image/);
+
+	const execTool = tools.find((t) => t.name === "docker_exec");
+	let threw = false;
+	try {
+		await execTool.execute("id", { id: "-x", command: "ls" }, undefined, undefined, {});
+	} catch (e) {
+		threw = /invalid container id/.test(e.message);
+	}
+	if (!threw) throw new Error("docker_exec with a flag-like id should be rejected");
+	console.log("  input validation: bad name/port/volume/memory/image/id rejected cleanly");
 }
 
 console.log("\nSMOKE TEST OK");

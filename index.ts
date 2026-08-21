@@ -228,15 +228,81 @@ function splitCommand(cmd: string): string[] {
 	return out;
 }
 
+/** Real path of the workspace root (resolved once; follows symlinks in the path). */
+let realHostRoot: string | undefined;
+function realHostRootPath(): string {
+	if (realHostRoot === undefined) {
+		try {
+			realHostRoot = fs.realpathSync(hostRoot);
+		} catch {
+			realHostRoot = hostRoot;
+		}
+	}
+	return realHostRoot;
+}
+
+/**
+ * True if `target` resolves (through symlinks) to a path inside the workspace
+ * root. Handles non-existent targets by resolving the deepest existing
+ * ancestor and re-appending the missing suffix.
+ */
+function realpathWithin(target: string): boolean {
+	const root = realHostRootPath();
+	let probe = target;
+	const suffix: string[] = [];
+	while (!fs.existsSync(probe)) {
+		const parent = path.dirname(probe);
+		if (parent === probe) return false; // reached filesystem root
+		suffix.unshift(path.basename(probe));
+		probe = parent;
+	}
+	let realProbe: string;
+	try {
+		realProbe = fs.realpathSync(probe);
+	} catch {
+		return false;
+	}
+	const realTarget = suffix.length ? path.join(realProbe, ...suffix) : realProbe;
+	const rel = path.relative(root, realTarget);
+	return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** Reject values that could be interpreted as docker CLI flags or inject output. */
+function assertSafeArg(value: string, what: string): void {
+	if (!value || value.startsWith("-")) {
+		throw new Error(`docker: invalid ${what} "${value}" (must not be empty or start with "-")`);
+	}
+	if (/[\r\n\x00]/.test(value)) {
+		throw new Error(`docker: invalid ${what} (must not contain newlines or NUL)`);
+	}
+}
+
 function mapHostPath(input: string): string {
 	const trimmed = (input ?? "").trim();
 	if (!trimmed) throw new Error("docker: empty path");
+	let resolved: string;
 	if (trimmed.startsWith("/workspace")) {
 		const rel = trimmed.slice("/workspace".length).replace(/^\/+/, "");
-		return rel ? path.join(hostRoot, rel) : hostRoot;
+		resolved = rel ? path.join(hostRoot, rel) : hostRoot;
+	} else if (path.isAbsolute(trimmed)) {
+		resolved = trimmed;
+	} else {
+		resolved = path.resolve(hostRoot, trimmed);
 	}
-	if (path.isAbsolute(trimmed)) return trimmed;
-	return path.resolve(hostRoot, trimmed);
+	// Confine to the workspace: reject any path that escapes hostRoot. This is
+	// the core isolation guarantee — the agent must not be able to reach host
+	// paths outside the mounted workspace (via /workspace/.. traversal or an
+	// absolute host path), because these paths are used in host-side fs calls
+	// (existence checks, docker_init writes) as well as sandbox-side mounts.
+	const rel = path.relative(hostRoot, resolved);
+	if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+		throw new Error(`docker: path escapes the workspace: ${input}`);
+	}
+	// Also reject symlinks inside the workspace that point outside it.
+	if (!realpathWithin(resolved)) {
+		throw new Error(`docker: path escapes the workspace (symlink): ${input}`);
+	}
+	return resolved;
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,7 +318,13 @@ function runSbxCli(args: string[], timeoutMs?: number): Promise<ExecResult> {
 			args,
 			{ env: scrubbedEnv(), timeout: timeoutMs, maxBuffer: 128 * 1024 * 1024, windowsHide: true },
 			(err, stdout, stderr) => {
-				const code = err ? (err as NodeJS.ErrnoException & { code?: number }).code ?? 1 : 0;
+				// execFile's err.code is string (e.g. "ENOENT") | number (exit code) | null (signal).
+				// Normalize to a number so callers can compare reliably.
+				let code = 0;
+				if (err) {
+					const c = (err as NodeJS.ErrnoException).code;
+					code = typeof c === "number" ? c : 1;
+				}
 				resolve({ code, stdout: stdout ?? "", stderr: stderr ?? "" });
 			},
 		);
@@ -276,13 +348,13 @@ async function ensureSandbox(): Promise<string> {
 	}
 	const cpus = env.DOCKER_SANDBOX_CPUS ?? "2";
 	let mem = env.DOCKER_SANDBOX_MEMORY ?? "2g";
-	// sbx requires >= 1 GiB of memory
-	const m = /^(\d+)\s*([gGmM])?$/.exec(mem.trim());
+	// sbx requires >= 1 GiB of memory (accept decimal values like 2.5g / 512m).
+	const m = /^(\d+(?:\.\d+)?)\s*([gGmM])?$/.exec(mem.trim());
 	if (m) {
 		const v = Number(m[1]);
 		const unit = (m[2] ?? "g").toLowerCase();
-		if (unit === "g" && v < 1) mem = "1g";
-		if (unit === "m" && v < 1024) mem = "1g";
+		const giB = unit === "m" ? v / 1024 : v;
+		if (giB < 1) mem = "1g";
 	} else {
 		mem = "2g";
 	}
@@ -586,6 +658,7 @@ async function toolPs(all: boolean): Promise<string> {
 }
 
 async function toolPull(image: string): Promise<string> {
+	assertSafeArg(image, "image");
 	const out = await docker(["pull", image], 600_000);
 	const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
 	const interesting = lines.filter((l) => /Status:|Digest:|Downloaded newer|up to date/i.test(l));
@@ -628,16 +701,32 @@ async function toolRun(params: RunParams): Promise<string> {
 	const args = ["run"];
 	args.push("--label", "com.pi.sandbox=true");
 	const foreground = params.detach === false;
+	if (params.rm && !foreground) {
+		throw new Error("docker run: --rm cannot be combined with a detached run (detach defaults to true); use detach=false for a foreground run that auto-removes");
+	}
 	if (!foreground) args.push("-d");
 	if (params.rm) args.push("--rm");
-	if (params.name) args.push("--name", params.name);
-	for (const p of params.ports ?? []) args.push("-p", p);
+	if (params.name) {
+		assertSafeArg(params.name, "container name");
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(params.name)) {
+			throw new Error(`docker run: invalid container name "${params.name}"`);
+		}
+		args.push("--name", params.name);
+	}
+	for (const p of params.ports ?? []) {
+		const spec = p.trim();
+		if (!/^\d+(?::\d+)?(\/(udp|tcp))?$/.test(spec)) {
+			throw new Error(`docker run: bad port spec "${p}" (use HOST:CONTAINER[/udp], e.g. "8080:3000")`);
+		}
+		args.push("-p", spec);
+	}
 	for (const e of Array.isArray(params.env) ? params.env : (params.env ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
-		if (e) args.push("-e", e);
+		if (e.startsWith("-")) throw new Error(`docker run: bad env entry "${e}"`);
+		args.push("-e", e);
 	}
 	for (const v of params.volumes ?? []) {
 		const parts = v.split(":");
-		if (parts.length < 2) throw new Error(`docker run: bad volume spec "${v}" (use host:container[:ro])`);
+		if (parts.length < 2 || !parts[0] || !parts[1]) throw new Error(`docker run: bad volume spec "${v}" (use host:container[:ro])`);
 		const hostPart = mapHostPath(parts[0]);
 		const rest = parts.slice(1).join(":");
 		// In RO-workspace mode, binds sourced from the project are read-only by
@@ -650,8 +739,14 @@ async function toolRun(params: RunParams): Promise<string> {
 	// sandbox VM being idle-stopped by sandboxd; foreground runs stay ephemeral.
 	const restart = params.restart ?? (foreground ? "no" : "unless-stopped");
 	if (restart && restart !== "no") args.push("--restart", restart);
-	if (params.memory) args.push("-m", params.memory);
+	if (params.memory) {
+		if (!/^\d+(\.\d+)?[bkmg]?$/i.test(params.memory.trim())) {
+			throw new Error(`docker run: bad memory limit "${params.memory}" (use e.g. 512m, 1g)`);
+		}
+		args.push("-m", params.memory.trim());
+	}
 	if (params.workdir) args.push("-w", params.workdir);
+	assertSafeArg(params.image, "image");
 	args.push(params.image);
 	if (params.command) {
 		const cmd = Array.isArray(params.command) ? params.command : splitCommand(params.command);
@@ -715,6 +810,7 @@ async function toolRun(params: RunParams): Promise<string> {
 }
 
 async function toolLogs(id: string, tail: number, timestamps: boolean): Promise<string> {
+	assertSafeArg(id, "container id");
 	const args = ["logs"];
 	if (tail > 0) args.push("--tail", String(tail));
 	if (timestamps) args.push("--timestamps");
@@ -724,6 +820,10 @@ async function toolLogs(id: string, tail: number, timestamps: boolean): Promise<
 }
 
 async function toolExec(id: string, command: string | string[]): Promise<string> {
+	if (command === undefined || command === null || (typeof command === "string" && !command.trim())) {
+		throw new Error("docker exec: empty command");
+	}
+	assertSafeArg(id, "container id");
 	const cmd = Array.isArray(command) ? command : splitCommand(command);
 	if (!cmd.length) throw new Error("docker exec: empty command");
 	const out = await docker(["exec", id, ...cmd]);
@@ -741,8 +841,16 @@ async function toolBuild(
 	const stat = fs.statSync(hostContext);
 	if (!stat.isDirectory()) throw new Error(`docker build: context must be a directory: ${context}`);
 
+	assertSafeArg(tag, "tag");
 	const args = ["build", "-t", tag];
-	if (dockerfile) args.push("-f", path.join(hostContext, dockerfile));
+	if (dockerfile) {
+		const df = path.resolve(hostContext, dockerfile);
+		const dfRel = path.relative(hostContext, df);
+		if (dfRel === ".." || dfRel.startsWith(`..${path.sep}`) || path.isAbsolute(dfRel)) {
+			throw new Error(`docker build: dockerfile path escapes the context: ${dockerfile}`);
+		}
+		args.push("-f", df);
+	}
 	if (buildArgs) {
 		try {
 			const parsed = JSON.parse(buildArgs) as Record<string, unknown>;
@@ -862,6 +970,12 @@ async function toolCompose(
 	}
 
 	const args = ["compose", "-f", hostFile];
+	if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(action)) {
+		throw new Error(`docker compose: invalid action "${action}"`);
+	}
+	if (service && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(service)) {
+		throw new Error(`docker compose: invalid service "${service}"`);
+	}
 	switch (action) {
 		case "up":
 			args.push("up", "-d", "--build");
@@ -989,6 +1103,7 @@ async function unpublishMappingsFor(sandboxPorts: Set<string>): Promise<string[]
 }
 
 async function toolLifecycle(id: string, op: "stop" | "start" | "rm"): Promise<string> {
+	assertSafeArg(id, "container id");
 	switch (op) {
 		case "stop":
 			await docker(["stop", "--time", "10", id]);
@@ -1024,6 +1139,27 @@ async function toolLifecycle(id: string, op: "stop" | "start" | "rm"): Promise<s
 	}
 }
 
+/** HTTP methods docker_curl may issue (no CONNECT/TRACE — no tunneling). */
+const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "OPTIONS"]);
+/** Max request body size for docker_curl (1 MiB). */
+const MAX_CURL_BODY = 1024 * 1024;
+
+/** Host ports currently published by this session's sandbox (from `sbx ports`). */
+async function publishedHostPorts(): Promise<Set<number>> {
+	const name = sessionSandboxName();
+	const out = new Set<number>();
+	try {
+		const r = await runSbxCli(["ports", name]);
+		for (const line of r.stdout.split("\n")) {
+			const m = /127\.0\.0\.1\s+(\d+)\s+\d+\s+(tcp|udp)/.exec(line);
+			if (m) out.add(Number(m[1]));
+		}
+	} catch {
+		/* no published ports */
+	}
+	return out;
+}
+
 /** Host-side HTTP request to a host-local published port (sbx forwards 127.0.0.1 only). */
 async function toolCurl(url: string, timeoutSec: number, method: string, body: string | undefined): Promise<string> {
 	let u: URL;
@@ -1032,22 +1168,45 @@ async function toolCurl(url: string, timeoutSec: number, method: string, body: s
 	} catch {
 		throw new Error(`docker_curl: invalid URL "${url}" (use e.g. http://127.0.0.1:8080/health)`);
 	}
-	if (!["127.0.0.1", "localhost", "::1"].includes(u.hostname)) {
+	// URL.hostname keeps brackets for IPv6 literals ("[::1]"); normalize for the
+	// allowlist check and for http.request.
+	const host = u.hostname.replace(/^\[|\]$/g, "");
+	if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
 		throw new Error(
 			`docker_curl: only host-local published ports are reachable from the host process ` +
 				`(sbx binds 127.0.0.1; tried host "${u.hostname}"). For the sandbox-internal address use docker_exec.`,
 		);
 	}
+	const port = Number(u.port || 80);
+	// Confine to ports THIS sandbox actually published — docker_curl is for
+	// verifying a deployed container, not a general host-localhost HTTP client
+	// (which could otherwise probe unrelated host services on localhost).
+	const published = await publishedHostPorts();
+	if (!published.has(port)) {
+		throw new Error(
+			`docker_curl: port ${port} is not published by this sandbox. ` +
+				`Published host ports: ${published.size ? [...published].sort((a, b) => a - b).join(", ") : "(none)"}. ` +
+				`Start a container with docker_run(ports=[...]) or docker_compose up first.`,
+		);
+	}
 	const meth = (method || "GET").toUpperCase();
+	if (!ALLOWED_METHODS.has(meth)) {
+		throw new Error(`docker_curl: unsupported method "${method}" (allowed: ${[...ALLOWED_METHODS].join(", ")})`);
+	}
 	const hasBody = body !== undefined;
+	if (hasBody && Buffer.byteLength(body ?? "") > MAX_CURL_BODY) {
+		throw new Error(`docker_curl: body exceeds ${MAX_CURL_BODY} bytes`);
+	}
+	const timeoutMs = (Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : 10) * 1000;
 	const result = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; text: string }>((resolve, reject) => {
 		const req = http.request(
 			{
-				host: u.hostname,
-				port: Number(u.port || 80),
+				host,
+				port,
 				path: `${u.pathname}${u.search}`,
 				method: meth,
-				timeout: Math.max(1, timeoutSec) * 1000,
+				timeout: timeoutMs,
+				...(host.includes(":") ? { family: 6 } : {}),
 				headers: {
 					accept: "*/*",
 					"user-agent": "pi-docker-sandbox/1",
@@ -1085,6 +1244,10 @@ async function toolInit(
 		return `docker_init: ${path.join(dir, "Dockerfile")} already exists (pass force=true to overwrite).`;
 	}
 
+	const LANGS = new Set(["node", "pnpm", "go", "python", "rust", "generic"]);
+	if (opts.lang && !LANGS.has(opts.lang.toLowerCase())) {
+		throw new Error(`docker_init: unknown lang "${opts.lang}" (use node|pnpm|go|python|rust|generic)`);
+	}
 	const lang: Lang = opts.lang ? (opts.lang.toLowerCase() as Lang) : detectLang(dir);
 	const port = opts.lang === "go" || lang === "go" ? 8080 : lang === "python" ? 8000 : lang === "generic" ? 8080 : 3000;
 
@@ -1119,15 +1282,18 @@ async function toolVerify(): Promise<string> {
 	// DOCKER_* sentinel is injected into the HOST process env; runSbxCli's
 	// scrubber must strip it before the sbx exec child (and thus the sandbox)
 	// ever sees it. If the scrubber regresses, the sentinel leaks and fails.
-	env.DOCKER_HOST_SENTINEL = "sbx-scrub-probe";
+	// The sentinel name is unique per call so concurrent verifies cannot
+	// interfere with each other's probe.
+	const sentinel = `DOCKER_HOST_SENTINEL_${Math.random().toString(36).slice(2, 8)}`;
+	env[sentinel] = "sbx-scrub-probe";
 	let envOk = false;
 	let envOut = "";
 	try {
 		const envCheck = await runSbxCli(["exec", name, "--", "sh", "-c", "env | grep -iE '^(DOCKER_|COMPOSE_)' || echo __CLEAN__"]);
 		envOut = `${envCheck.stdout}\n${envCheck.stderr}`.trim();
-		envOk = envCheck.code === 0 && envOut.includes("__CLEAN__") && !envOut.includes("DOCKER_HOST_SENTINEL");
+		envOk = envCheck.code === 0 && envOut.includes("__CLEAN__") && !envOut.includes(sentinel);
 	} finally {
-		delete env.DOCKER_HOST_SENTINEL;
+		delete env[sentinel];
 	}
 	results.push({
 		check: "env: no DOCKER_*/COMPOSE_* variables leak into the sandbox",
@@ -1140,15 +1306,16 @@ async function toolVerify(): Promise<string> {
 	// reach the sandbox (probe technique, but for a NON-docker var so it is
 	// subject to the allowlist gate, not just the docker scrub).
 	if (!envPassthrough()) {
-		env.__PI_DOCKER_SANDBOX_VERIFY_PROBE__ = "sbx-env-probe";
+		const probeName = `__PI_DOCKER_SANDBOX_VERIFY_PROBE_${Math.random().toString(36).slice(2, 8)}__`;
+		env[probeName] = "sbx-env-probe";
 		let probeOk = false;
 		let probeOut = "";
 		try {
-			const probe = await runSbxCli(["exec", name, "--", "sh", "-c", "env | grep __PI_DOCKER_SANDBOX_VERIFY_PROBE__ || echo __PROBE_ABSENT__"]);
+			const probe = await runSbxCli(["exec", name, "--", "sh", "-c", `env | grep -F ${probeName} || echo __PROBE_ABSENT__`]);
 			probeOut = `${probe.stdout}\n${probe.stderr}`.trim();
-			probeOk = probe.code === 0 && probeOut.includes("__PROBE_ABSENT__") && !probeOut.includes("__PI_DOCKER_SANDBOX_VERIFY_PROBE__");
+			probeOk = probe.code === 0 && probeOut.includes("__PROBE_ABSENT__") && !probeOut.includes(probeName);
 		} finally {
-			delete env.__PI_DOCKER_SANDBOX_VERIFY_PROBE__;
+			delete env[probeName];
 		}
 		results.push({
 			check: "env: restricted forwarding (allowlist/strict) — non-allowlisted vars do not reach the sandbox",
@@ -1229,14 +1396,15 @@ async function toolVerify(): Promise<string> {
 	}
 	results.push(sockResult);
 
-	// 7. port bindings are host-localhost only
-	const ls = await runSbxCli(["ls"]);
-	const row = ls.stdout.split("\n").find((l) => l.includes(name)) ?? "";
-	const nonLocal = /0\.0\.0\.0:[0-9]/.test(row) && !/127\.0\.0\.1/.test(row);
+	// 7. port bindings are host-localhost only (inspect the actual `sbx ports`
+	// mappings rather than the `sbx ls` row, which may not render ports).
+	const portsList = await runSbxCli(["ports", name]);
+	const portLines = portsList.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+	const nonLocal = portLines.some((l) => !/^127\.0\.0\.1\s/.test(l) && /\d+\s+\d+\s+(tcp|udp)/.test(l));
 	results.push({
 		check: "network: published ports bind to host 127.0.0.1 only",
 		ok: !nonLocal,
-		evidence: nonLocal ? row.trim() : (row.trim() || "no published ports currently"),
+		evidence: nonLocal ? portLines.filter((l) => !/^127\.0\.0\.1\s/.test(l)).join("; ") : (portLines.join("; ") || "no published ports currently"),
 	});
 
 	const failed = results.filter((r) => !r.ok);
@@ -1269,6 +1437,8 @@ function keepalive(): boolean {
 	return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+let watchdogArmed = false;
+
 /**
  * Arm a detached watchdog that tears the sandbox down when THIS pi process
  * exits — works even for SIGKILL/power kills that never fire session_shutdown.
@@ -1288,6 +1458,10 @@ function spawnWatchdog(): void {
 	// applies even when teardown is "none" — a pinned/shared sandbox is exactly
 	// the case where you want the VM kept alive but NOT removed.
 	if (mode === "none" && !keep) return;
+	// Arm once per process: session_start and ensureSandbox both call this, and
+	// a second watchdog would just duplicate the same teardown/keepalive work.
+	if (watchdogArmed) return;
+	watchdogArmed = true;
 	const op = mode === "stop" ? `stop ${name}` : `rm --force ${name}`;
 	const keepLine = keep ? `if [ $((i % 12)) -eq 0 ]; then ${findSbxCli()} ls 2>/dev/null | grep -Fq ${name} && ${findSbxCli()} exec ${name} -- true 2>/dev/null; fi` : "";
 	const lines = [
@@ -1415,8 +1589,16 @@ async function gcSweep(hours: number): Promise<string> {
 	for (const b of boxes) {
 		const n = b.name;
 		if (!n || !n.startsWith("pi-sbx-") || n === current) continue;
-		if (b.status === "running") {
+		const status = (b.status ?? "").trim().toLowerCase();
+		if (status === "running") {
 			kept.push(`${n} (running)`);
+			continue;
+		}
+		// Conservative: only remove sandboxes we can positively identify as
+		// stopped. Unknown/unexpected status strings are kept (never removed) —
+		// a misread status must not cause a running sandbox to be reaped.
+		if (status !== "stopped") {
+			kept.push(`${n} (status "${b.status ?? "?"}" — kept)`);
 			continue;
 		}
 		// Sibling guard: never remove a sandbox whose owner pi process is alive
@@ -1672,7 +1854,8 @@ export default function (pi: ExtensionAPI) {
 			"publishes container ports on host 127.0.0.1 only, and this runs in the host pi process, so it is the way " +
 			"to check a running service from the agent (the agent's VM cannot reach host loopback). " +
 			"url: e.g. http://127.0.0.1:8080/health. method: GET (default), POST, PUT, etc. body: optional request body " +
-			"(content-type application/json). Only 127.0.0.1/localhost/::1 hosts are allowed. Returns status + body.",
+			"(content-type application/json). Only 127.0.0.1/localhost/::1 hosts AND ports published by this sandbox " +
+			"are reachable. Returns status + body.",
 		parameters: Type.Object({
 			url: Type.String({ description: "Host-local URL of the published port, e.g. http://127.0.0.1:8080/health" }),
 			timeoutSec: Type.Optional(Type.Number({ description: "Timeout in seconds (default 10)" })),
@@ -1749,4 +1932,4 @@ export default function (pi: ExtensionAPI) {
 }
 
 // Named exports for tests (pi's loader only calls the default factory).
-export { scrubbedEnv, envForwardMode, envAllowlist, envPassthrough, sessionSandboxName };
+export { scrubbedEnv, envForwardMode, envAllowlist, envPassthrough, sessionSandboxName, mapHostPath, assertSafeArg };

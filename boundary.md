@@ -65,7 +65,7 @@ host macOS  (trusted operator)
 | Host env confidentiality | `DOCKER_*`/`COMPOSE_*` always stripped; secure by default (only a minimal safe set is forwarded); `DOCKER_SANDBOX_ENV_ALLOWLIST` opts in to specific vars, `_PASSTHROUGH` opts out entirely; `docker_verify` audits the active mode |
 | Host files untouched | Only the session workspace is mounted into the sandbox; host `~/.docker`, `~/.ssh` etc. are not visible (audited by `docker_verify`) |
 | Project writes (optional) | `DOCKER_SANDBOX_WORKSPACE_RO=1` → project mounted read-only; all project writes must go through the agent's own tools |
-| Ports | Published on host `127.0.0.1` only (`sbx ports`); the agent probes them with `docker_curl` (host-side fetch); the agent's VM cannot reach host loopback |
+| Ports | Published on host `127.0.0.1` only (`sbx ports`); the agent probes them with `docker_curl` (host-side fetch, confined to ports this sandbox published); the agent's VM cannot reach host loopback |
 
 ## Ports & networking (verified rules)
 
@@ -98,7 +98,8 @@ host macOS  (trusted operator)
    pokes the sandbox every ~60s while the pi session is alive).
 6. **Verification paths**:
    - Agent → `docker_curl http://127.0.0.1:<hostport>/` (host-side fetch;
-     GET/POST/PUT with optional body).
+     GET/POST/PUT with optional body; only ports this sandbox published are
+     reachable).
    - Sandbox-internal → `docker_exec` against `127.0.0.1:<port>` (same docker
      network).
    - Human → open `http://localhost:<hostport>/` on the host.

@@ -31,7 +31,11 @@ own sandbox microVM** and the host's docker is never exposed to it.
    share or observe each other's docker state.
 5. **Filesystem.** Only the session workspace (the dir mounted at `/workspace`
    in the agent VM) is direct-mounted into the sandbox. Host `~/.docker`,
-   `~/.ssh`, `~/.agent`, and other host paths are not mounted.
+   `~/.ssh`, `~/.agent`, and other host paths are not mounted. Path mapping is
+   confined to the workspace: `/workspace/..` traversal, absolute host paths,
+   and symlinks that point outside the workspace are all rejected
+   (`mapHostPath`), so the agent cannot reach host paths outside the mounted
+   workspace via build contexts, volume binds, or `docker_init`.
 6. **Env confidentiality (secure by default).** `DOCKER_*`/`COMPOSE_*` are
    always stripped from every child env. By default only a minimal safe set
    (`HOME`, `PATH`, `USER`, `LOGNAME`, `TMPDIR`, `SHELL`, `LANG`, `TERM`) is
@@ -40,6 +44,12 @@ own sandbox microVM** and the host's docker is never exposed to it.
    `DOCKER_SANDBOX_ENV_PASSTHROUGH=1` (host env minus the docker vars).
    Anything running inside the sandbox can read whatever reaches it — this
    knob confines that surface.
+7. **Input validation.** Tool arguments that reach the docker CLI positionally
+   (container ids, image refs, tags, names) are validated to reject values that
+   start with `-` (which docker would parse as flags) or contain control
+   characters. `docker_run` validates port/volume/memory specs, and
+   `docker_curl` is restricted to a safe HTTP-method allowlist and a 1 MiB body
+   limit.
 
 ### Read-only workspace mode (`DOCKER_SANDBOX_WORKSPACE_RO=1`)
 
@@ -115,3 +125,6 @@ sandboxes are never touched.
   level as any agent tooling writing to the workspace.
 - `sbx` port forwarding binds `127.0.0.1` on the host; apps inside the sandbox
   are not reachable from the LAN unless the host user forwards further.
+- `docker_curl` is confined to ports the sandbox itself published (it reads the
+  live `sbx ports` mappings and rejects any other host-localhost port), so it
+  cannot be used to probe unrelated host services on localhost.

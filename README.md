@@ -105,7 +105,7 @@ workspace mounted). No manual steps required.
 | `docker_init` | Scaffold a Dockerfile (+ compose) with language detection |
 | `docker_compose` | Deploy/manage compose projects (`up -d --build`) |
 | `docker_stop` / `docker_start` / `docker_rm` | Container lifecycle |
-| `docker_curl` | Probe a published port from the host process (GET/POST/PUT) |
+| `docker_curl` | Probe a published port from the host process (GET/POST/PUT; only ports this sandbox published) |
 | `docker_sandbox_rm` | Remove this session's sandbox (microVM + everything inside) |
 | `docker_gc` | Sweep stale `pi-sbx-*` sandboxes left by crashed sessions |
 
@@ -164,7 +164,8 @@ persistent name (e.g. a shared sandbox reused across restarts), pin
   mappings; after a host reboot let the session-start GC handle it, or run
   `sbx rm --force $(sbx ls -q | grep pi-sbx)` from a host pane.
 - Agent-side verification: `docker_curl` (host-side fetch, GET/POST/PUT with
-  optional body); human-side: `http://localhost:<hostport>/`.
+  optional body, confined to ports this sandbox published); human-side:
+  `http://localhost:<hostport>/`.
 
 See [boundary.md](boundary.md) for the full agent ↔ sbx boundary
 model and usage guide (agent + human). The extension is not dependent on
@@ -203,6 +204,11 @@ The agent's VM mounts the workspace at `/workspace`; the extension maps
 `/workspace/<rel>` → `<host pi cwd>/<rel>`, which is also the path inside the
 sandbox (the workspace is direct-mounted there). So `docker_build` contexts
 and `docker_run` volume binds "just work".
+
+The mapping is **confined to the workspace**: `/workspace/..` traversal,
+absolute host paths, and symlinks that point outside the workspace are all
+rejected, so the agent cannot reach host paths outside the mounted workspace
+via build contexts, volume binds, or `docker_init`.
 
 ## Example deploy flow
 
