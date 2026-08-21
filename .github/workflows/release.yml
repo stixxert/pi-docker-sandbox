@@ -11,11 +11,13 @@ on:
   workflow_dispatch:
 
 # GITHUB_TOKEN is read-only by default; semantic-release needs write access
-# to push the release tag and create the GitHub Release.
+# to push the release tag and create the GitHub Release, plus issues: write
+# to file a failure-notification issue when a release run fails.
 # id-token: write lets GitHub mint a short-lived OIDC token that npm verifies
 # against the package's trusted publisher config — no NPM_TOKEN secret needed.
 permissions:
   contents: write
+  issues: write
   id-token: write
 
 jobs:
