@@ -4,6 +4,15 @@ A [pi](https://pi.dev) extension that gives an AI coding agent a **private
 docker sandbox** to deploy into — powered by
 [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`).
 
+**How this sandboxes pi.** There are many ways to sandbox pi: wrap the whole
+agent in a container or dedicated VM, confine it in a locked-down workspace,
+or — as this project does — give pi a sandbox *to deploy into*. This is a
+**pi extension, not a wrapper**: pi itself is never contained. It keeps
+running in its normal host environment with its usual tools, workspace, and
+agent micro-VM; the extension only adds a separate private microVM — with its
+own docker daemon — as the agent's deploy target. What gets sandboxed here is
+the docker work, not the pi process.
+
 Each pi session gets its own **sandbox microVM with its own docker daemon**,
 running in parallel to the agent. The agent can pull images, build, run
 containers, and `docker compose up` — while the **host's docker is never
