@@ -51,7 +51,30 @@ jobs:
       - name: Update npm for trusted publishing
         run: npm install -g npm@latest
 
+      # semantic-release computes the version, bumps package.json, and creates
+      # the git tag + GitHub Release. @semantic-release/npm runs with
+      # npmPublish: false (see .releaserc), so the actual npm publish is done
+      # by the explicit step below and is visible in this workflow. The
+      # "released" flag is set when a new version tag was created this run.
       - name: Release
-        run: npx semantic-release
+        run: |
+          before=$(git describe --tags --abbrev=0 2>/dev/null || echo none)
+          npx semantic-release
+          after=$(git describe --tags --abbrev=0 2>/dev/null || echo none)
+          if [ "$before" != "$after" ]; then
+            echo "released=yes" >> "$GITHUB_ENV"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # npm publish via OIDC trusted publishing. npm CLI >= 11.5.1 (updated
+      # above) automatically detects the GitHub Actions OIDC token granted by
+      # the id-token: write permission and exchanges it against the package's
+      # trusted publisher on npmjs.com — no NPM_TOKEN secret, and a provenance
+      # attestation is attached automatically. Only runs when semantic-release
+      # actually produced a release in this run.
+      - name: Publish to npm (OIDC trusted publishing)
+        if: env.released == 'yes'
+        run: |
+          echo "Publishing $(git describe --tags --abbrev=0) to npm via trusted publishing"
+          npm publish
