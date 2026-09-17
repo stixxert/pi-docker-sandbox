@@ -14,6 +14,16 @@ for the **agent** and for the **human operator**.
 > Gondolin is used throughout this document simply as the concrete reference
 > deployment.
 
+> **Two modes.** This document describes the default **deploy target** mode,
+> where the sandbox exists for `docker_*` and the agent keeps using its own
+> tools. The repo also ships an **execution backend** (`sandbox/`) that routes
+> pi's built-in tools into the same sandbox, for which the agent's own VM drops
+> out of the picture and workspace paths are used as-is (the workspace is
+> direct-mounted at its host absolute path inside the sandbox, so no
+> `/workspace` hop is involved). See
+> [sandbox/README.md](sandbox/README.md) and
+> [security.md](security.md#execution-backend-built-in-tools-routed-into-the-sandbox).
+
 ## Topology
 
 ```

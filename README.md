@@ -32,6 +32,42 @@ daemon are a liability. With this extension:
   redirect it.
 - `docker_verify` runs a live isolation audit (PASS/FAIL per check).
 
+## Two modes
+
+**1. Deploy target (default).** `pi install` this package and the agent gets
+the `docker_*` tools: a private sbx microVM, with its own daemon, to deploy
+into. pi's own tools keep running wherever pi runs.
+
+**2. Execution backend.** Load `sandbox/` instead and pi runs *against* the
+sandbox: `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls` and your `!`
+commands all execute inside the sbx microVM, while pi itself stays on the
+host with its own auth, config, sessions and model keys.
+
+```bash
+cd /path/to/project
+pi -e /path/to/pi-docker-sandbox/sandbox
+```
+
+This is pi's "route tool execution into an isolated environment" pattern —
+the same shape as pi's [Gondolin
+example](https://github.com/earendil-works/pi-mono), with an sbx microVM as
+the target rather than a local QEMU VM. See [sandbox/README.md](sandbox/README.md).
+
+It is also the **lighter alternative to running pi inside a sandbox**: no
+template with pi baked in, no bootstrap seeding state into the sandbox, no
+per-project auth/sessions/credential handling, no sandbox rebuild to pick up
+a new pi version. The tools are *overridden*, not added — so the model's
+tool list is byte-for-byte the built-in one and not one prompt token is
+spent on the sandbox.
+
+The sandbox it creates can itself be slim: [template/](template/) builds a
+**648 MB** baseline automatically (vs ~2.2 GB for the pi-bearing template),
+because pi no longer has to live inside it. See
+[template/README.md](template/README.md).
+
+Both modes can be active at once; the `docker_*` tools keep working when the
+backend is loaded.
+
 ## Requirements
 
 - [pi](https://pi.dev) (the extension runs in the host pi process)

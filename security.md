@@ -28,7 +28,9 @@ own sandbox microVM** and the host's docker is never exposed to it.
 4. **Per-session sandboxes.** Each pi session gets a uniquely named sandbox
    (`pi-sbx-<pid>-<random>`, or an explicit `DOCKER_SANDBOX`), auto-provisioned
    with only the session's workspace mounted. Two concurrent sessions cannot
-   share or observe each other's docker state.
+   share or observe each other's docker state. (The execution backend below
+   pins a per-project name instead, which makes the sandbox project-scoped and
+   no longer removed at exit — see that section.)
 5. **Filesystem.** Only the session workspace (the dir mounted at `/workspace`
    in the agent VM) is direct-mounted into the sandbox. Host `~/.docker`,
    `~/.ssh`, `~/.agent`, and other host paths are not mounted. Path mapping is
@@ -67,6 +69,43 @@ project as an **additional read-only** workspace. Consequences (all verified):
 - All project writes must go through the agent's own tools (`/workspace` in
   its VM) — the intended trust boundary. The sandbox becomes a pure
   read-and-execute environment for the project.
+
+Read-only mode is **not** usable together with the execution backend below:
+that backend's `write`/`edit`/`mkdir` operate on the mounted project, so they
+would simply fail.
+
+## Execution backend (built-in tools routed into the sandbox)
+
+The `sandbox/` entry point uses the *same* sandbox differently: pi stays on the
+host and `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls` plus the user's
+`!` commands execute **inside** it (see [sandbox/README.md](sandbox/README.md)).
+It protects a different thing, so it carries its own guarantees:
+
+1. **The host environment does not leak in.** pi's `bash` tool builds its child
+   environment from the *full* host environment, so forwarding it verbatim
+   would copy host API keys and tokens into the sandbox. Only `PI_*` session
+   metadata is forwarded (plus names listed in `DOCKER_SANDBOX_ENV_ALLOWLIST`),
+   and `DOCKER_*`/`COMPOSE_*` can never be allowlisted. Covered by a test.
+2. **The agent's file access is confined to the sandbox.** Because the file
+   tools are overridden, not just the shell, an absolute path resolves inside
+   the sandbox — no built-in tool can read or write a host path outside the
+   mounted workspace.
+3. **No shell-injection surface.** Paths and file bodies are passed as
+   *positional* arguments to `sh -c`, never spliced into the script text, so a
+   path cannot be reinterpreted as shell syntax or as a CLI option.
+4. **`grep` is reimplemented over the transport.** pi's grep tool spawns host
+   ripgrep regardless of custom operations; the backend walks and matches
+   in-sandbox instead, so a search cannot silently read host files.
+
+What this mode does **not** do:
+
+- **It does not confine pi's own process.** Extension tools other than these
+  built-in overrides still run on the host (subagents, `webshot`, ...). This is
+  a sandbox for the tools, not a wrapper around pi.
+- The sandbox has network access per its sbx network policy, and its own `/etc`,
+  `/usr` and so on are readable by the agent.
+- Killing the `sbx`/`docker` CLI on abort does not necessarily kill a process
+  already running inside the VM.
 
 ## Live verification: `docker_verify`
 

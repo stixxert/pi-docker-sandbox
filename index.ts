@@ -1644,6 +1644,36 @@ function textResult(text: string): AgentToolResult<undefined> {
 /* extension registration                                              */
 /* ------------------------------------------------------------------ */
 
+let lifecycleArmed = false;
+
+/**
+ * Arm everything that must outlive a session: the detached watchdog (teardown
+ * on pi exit + keepalive pokes while pi lives), the owner marker that stops GC
+ * reclaiming a live sandbox, and the startup sweep of stale sandboxes.
+ *
+ * Idempotent: the docker_* extension and the sandbox execution backend both
+ * call this from their own session_start, and loading both must not double-arm.
+ *
+ * Called separately from ensureSandbox() on purpose — ensureSandbox returns
+ * early when the sandbox ALREADY exists (a pinned DOCKER_SANDBOX, a resumed
+ * session), so arming only there would silently skip keepalive/teardown for
+ * every sandbox that was not created by this process.
+ */
+async function armSessionLifecycle(): Promise<void> {
+	if (lifecycleArmed) return;
+	lifecycleArmed = true;
+	spawnWatchdog();
+	writeOwnerMarker(sessionSandboxName());
+	const raw = Number(env.DOCKER_SANDBOX_GC_HOURS ?? "24");
+	if (!Number.isFinite(raw) || raw <= 0) return;
+	// Deliberately NOT awaited: the sweep is a background safety net for stale
+	// sandboxes from crashed sessions, and session start must not wait on
+	// `sbx ls` (and any sandboxd round trip) to get there.
+	void gcSweep(raw)
+		.then((summary) => console.error(`[docker-sandbox] ${summary}`))
+		.catch((e) => console.error(`[docker-sandbox] gc at startup failed: ${(e as Error).message}`));
+}
+
 export default function (pi: ExtensionAPI) {
 	// Lifecycle: tear down this session's sandbox when the session ends
 	// (exit / Ctrl+C / Ctrl+D / SIGHUP / SIGTERM, /new, /resume, /fork).
@@ -1652,18 +1682,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Crash safety net: sweep stale pi-sbx-* sandboxes at session start, and
-	// arm the watchdog + owner marker for the current sandbox name (covers
-	// /resume case).
+	// arm the watchdog + owner marker for the current sandbox name (covers the
+	// /resume case). Shared with the sandbox execution backend, which needs the
+	// same lifecycle when it is loaded on its own.
 	pi.on("session_start", async () => {
-		spawnWatchdog();
-		writeOwnerMarker(sessionSandboxName());
-		const raw = Number(env.DOCKER_SANDBOX_GC_HOURS ?? "24");
-		if (!Number.isFinite(raw) || raw <= 0) return;
-		try {
-			console.error(`[docker-sandbox] ${await gcSweep(raw)}`);
-		} catch (e) {
-			console.error(`[docker-sandbox] gc at startup failed: ${(e as Error).message}`);
-		}
+		await armSessionLifecycle();
 	});
 
 	pi.registerTool({
@@ -1932,4 +1955,22 @@ export default function (pi: ExtensionAPI) {
 }
 
 // Named exports for tests (pi's loader only calls the default factory).
-export { scrubbedEnv, envForwardMode, envAllowlist, envPassthrough, sessionSandboxName, mapHostPath, assertSafeArg };
+// The sbx kernel is also shared with the `sandbox/` execution-backend
+// extension (host pi + tools routed into the sandbox), so that the sandbox
+// lifecycle, env scrubbing and path confinement exist in exactly one place.
+export {
+	scrubbedEnv,
+	envForwardMode,
+	envAllowlist,
+	envPassthrough,
+	sessionSandboxName,
+	mapHostPath,
+	assertSafeArg,
+	hostRoot,
+	findSbxCli,
+	runSbxCli,
+	sandboxExists,
+	ensureSandbox,
+	teardownSandbox,
+	armSessionLifecycle,
+};

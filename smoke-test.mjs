@@ -7,10 +7,10 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { loadTs } from "./test-loader.mjs";
 const require = createRequire(import.meta.url);
 
-// Node 24 strips types; import the .ts source directly.
-const mod = await import("./index.ts");
+const mod = await loadTs("./index.ts");
 if (typeof mod.default !== "function") throw new Error("extension must export a default factory");
 
 const tools = [];

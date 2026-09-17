@@ -12,6 +12,9 @@
   },
   "files": [
     "index.ts",
+    "sandbox/",
+    "template/",
+    "test-loader.mjs",
     "README.md",
     "boundary.md",
     "security.md",
@@ -24,6 +27,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node smoke-test.mjs",
+    "e2e": "node sandbox/e2e.mjs",
+    "template": "bash template/build.sh",
+    "template:check": "bash template/build.sh --check",
     "prepublishOnly": "npm run typecheck && npm test",
     "release": "semantic-release"
   },
