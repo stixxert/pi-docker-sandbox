@@ -87,10 +87,12 @@ entry; over `sbx exec` that would be N+3 sandbox round-trips per listing. A
 single POSIX-sh pass returns `d`/`f` + name and is memoised for the duration
 of that one tool call (verified: 25 entries => ≤ 4 round-trips).
 
-**It degrades instead of breaking.** If `sbx` is missing or the sandbox
-cannot be provisioned, the tools fall back to local execution, the user is
-notified, and the system prompt says so explicitly — the agent is never led
-to believe it is sandboxed when it is not.
+**It degrades instead of breaking.** If `sbx` is missing or the sandbox cannot
+be provisioned, the tools **fail closed** rather than silently running on the
+host: the call is refused with an actionable error naming the cause and the
+opt-in, the user is notified, and the system prompt says so explicitly — the
+agent is never led to believe it is sandboxed when it is not. Running directly
+on the host requires an explicit `DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1`.
 
 ## Trying it out (before publishing)
 
@@ -129,8 +131,9 @@ bash sandbox/try.sh --docker -- -p --tools read "Read /opt/only-in-sandbox.txt"
 
 If the first reports the container's OS and the second returns the file, the
 routing works. If the extension failed to load you get a missing-tool error
-instead — never a silent fallback to the host (that case is reported in the
-system prompt and via `/sbx`).
+instead — and if no sandbox can be resolved, tool calls are **refused** by
+default rather than falling back to the host (the refusal and its opt-in are
+reported in the system prompt and via `/sbx`).
 
 ### On the host, with real sbx
 
@@ -171,6 +174,7 @@ edits go through pi's own tools.
 | `DOCKER_SANDBOX_KEEPALIVE` | **default `1` here** — keeps the VM running for the life of the pi process; set `0` to allow idle-stop |
 | `DOCKER_SANDBOX_ENV_ALLOWLIST` | additionally export these host vars into the sandbox shell (default: `PI_*` only) |
 | `DOCKER_SANDBOX` | pin the sandbox name (also disables per-project derivation) |
+| `DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1` | **fail-closed default override** — permit tools to run directly on the host when no sandbox can be resolved (default: refuse) |
 | `SBX_EPHEMERAL` | `1` = throwaway per-session sandbox, removed at exit |
 | `SBX_PI_DEBUG` | `1` = log per-phase startup timings to stderr |
 | `DOCKER_SANDBOX_TEARDOWN` | `remove` / `stop` / `none` (a per-project sandbox defaults to `none`) |

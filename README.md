@@ -189,6 +189,11 @@ persistent name (e.g. a shared sandbox reused across restarts), pin
   extension runs inside the pi process, so stray console output would land on
   the same terminal the TUI is drawing and corrupt the chat. Turn it on when
   running `pi -p`, in a plain shell, or when diagnosing lifecycle issues.
+- `DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1` — allow tools to run directly on the
+  **host** when no sandbox can be resolved. **Off by default**: a missing `sbx`
+  CLI or an unstartable VM makes tool calls **fail closed** (refused with an
+  actionable error) rather than silently executing on the host, which is a
+  sandbox escape. Set this only if you accept unsandboxed execution.
 
 ## Ports (verified rules)
 
