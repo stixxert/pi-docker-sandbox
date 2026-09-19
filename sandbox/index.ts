@@ -41,7 +41,7 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { armSessionLifecycle, debugEnabled, envAllowlist, teardownSandbox } from "../index.ts";
-import { SandboxUnavailableError } from "./failure.ts";
+import { SandboxFailureEpisode, SandboxUnavailableError } from "./failure.ts";
 import {
 	createBashOps,
 	createEditOps,
@@ -79,8 +79,11 @@ export default function (pi: ExtensionAPI) {
 	let transport: ExecTransport | undefined;
 	let starting: Promise<ExecTransport | undefined> | undefined;
 	let lastError: string | undefined;
-	/** Have we already told the user about the CURRENT run of runtime failures? */
-	let sandboxFailureReported = false;
+	/**
+	 * Notification state for the CURRENT run of runtime failures. One message per
+	 * episode, reset by a successful round-trip — see `SandboxFailureEpisode`.
+	 */
+	const sandboxEpisode = new SandboxFailureEpisode();
 
 	/**
 	 * Forget the memoised transport so the next tool call re-resolves it.
@@ -88,10 +91,18 @@ export default function (pi: ExtensionAPI) {
 	 * This is the whole recovery mechanism: `resolveTransport()` re-derives the
 	 * sandbox and (re)starts the VM, so a runtime failure is an episode rather
 	 * than a permanent bricking of every remaining tool call in the session.
+	 *
+	 * `starting` is deliberately NOT reset here. It is non-undefined only while a
+	 * `resolveTransport()` is genuinely in flight, and that in-flight resolution
+	 * will itself publish a fresh transport when it settles — so the next
+	 * `ensureTransport()` awaits it, which is exactly the recovery we want.
+	 * Clearing it here would instead let a concurrent caller launch a SECOND
+	 * resolution, and each resolution can boot/create a VM. The resulting race is
+	 * benign today only because every resolution targets the same per-project
+	 * sandbox name and therefore reuses one VM; there is no reason to open it up.
 	 */
 	function invalidateTransport(): void {
 		transport = undefined;
-		starting = undefined;
 	}
 
 	/**
@@ -110,18 +121,21 @@ export default function (pi: ExtensionAPI) {
 	): Promise<T> {
 		try {
 			const result = await run();
-			sandboxFailureReported = false; // a success ends the episode
+			sandboxEpisode.succeeded(); // a success ends the episode
 			return result;
 		} catch (err) {
 			if (!(err instanceof SandboxUnavailableError)) throw err;
 			invalidateTransport();
-			if (!sandboxFailureReported) {
-				sandboxFailureReported = true;
+			// Tell the user ONCE per episode. The claim is only taken when a
+			// notification is actually deliverable (`ctx` present) — a failure we
+			// cannot surface must not swallow the episode's one message.
+			if (sandboxEpisode.claimNotification(ctx !== undefined)) {
 				ctx?.ui.notify(
-					`sbx sandbox "${err.target}" is unavailable — the sandbox runtime failed to start, so this tool ` +
-						`call did not run (it was NOT run on the host and was not retried). The next tool call will try ` +
-						`to start the sandbox again; if it keeps failing, the VM may need recreating (\`sbx ls\`, ` +
-						`then \`sbx stop ${err.target}\`).`,
+					`sbx sandbox "${err.target}" is unavailable — the sandbox runtime failed to start, so this ` +
+						`result is not the command's own exit status and the command's effects cannot be assumed ` +
+						`to have happened. The command was NOT run on the host and was not retried. The next tool ` +
+						`call will try to start the sandbox again; if it keeps failing, the VM may need recreating ` +
+						`(\`sbx ls\`, then \`sbx stop ${err.target}\`).`,
 					"error",
 				);
 			}
