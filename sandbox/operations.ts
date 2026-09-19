@@ -40,6 +40,7 @@ import type {
 	ReadOperations,
 	WriteOperations,
 } from "@earendil-works/pi-coding-agent";
+import { SandboxUnavailableError, isSandboxUnavailableFailure } from "./failure.ts";
 import { type ExecOptions, type ExecOutcome, type ExecTransport, shArgs, shQuote } from "./transport.ts";
 
 /** Files larger than this would exceed a comfortable argv budget when base64'd. */
@@ -77,19 +78,42 @@ function opOpts(extra?: ExecOptions): ExecOptions {
 	return { timeout: DEFAULT_OP_TIMEOUT, ...extra };
 }
 
+/**
+ * Throw if this outcome means the sandbox runtime itself failed to start.
+ *
+ * A non-zero exit from `sbx exec` is ambiguous: it is the inner command's
+ * status when the VM was reachable, and the CLI's own failure when it was not.
+ * This is the one place that ambiguity is resolved, so no call site below can
+ * mistake "the whole sandbox is down" for "this file does not exist".
+ */
+function throwIfSandboxUnavailable(t: ExecTransport, r: ExecOutcome): void {
+	if (isSandboxUnavailableFailure(r)) throw new SandboxUnavailableError(t.target, r.stderr.toString("utf8"));
+}
+
 async function must(t: ExecTransport, argv: string[], fallback: string, opts?: ExecOptions): Promise<ExecOutcome> {
 	const r = await t.exec(argv, opOpts(opts));
+	throwIfSandboxUnavailable(t, r);
 	if (r.exitCode !== 0) throw new Error(errText(r, fallback));
 	return r;
 }
 
+/**
+ * "Did this probe exit 0?" for the `test -e` / `test -r` style primitives.
+ *
+ * A transport-level rejection (spawn failure, abort, timeout) is still reported
+ * as `false` — that is what this helper is for. A sandbox-runtime failure is
+ * NOT: it propagates, so callers cannot silently turn a dead VM into "this path
+ * does not exist".
+ */
 async function ok(t: ExecTransport, argv: string[]): Promise<boolean> {
+	let r: ExecOutcome;
 	try {
-		const r = await t.exec(argv, opOpts());
-		return r.exitCode === 0;
+		r = await t.exec(argv, opOpts());
 	} catch {
 		return false;
 	}
+	throwIfSandboxUnavailable(t, r);
+	return r.exitCode === 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -215,7 +239,13 @@ export function createLsOps(t: ExecTransport): LsOperations {
 			if (knownHit !== undefined) return { isDirectory: () => knownHit };
 			const cached = listings.get(path.dirname(p));
 			if (cached) {
-				const entries = await cached.catch(() => undefined);
+				// A failed parent listing is normally "not there / unreadable", which
+				// just means "fall through to a direct probe". A sandbox-runtime
+				// failure is not that, and must not be swallowed.
+				const entries = await cached.catch((err) => {
+					if (err instanceof SandboxUnavailableError) throw err;
+					return undefined;
+				});
 				const hit = entries?.get(path.basename(p));
 				if (hit !== undefined) {
 					known.set(p, hit);
@@ -253,13 +283,16 @@ async function gitSearchableFiles(t: ExecTransport, root: string): Promise<strin
 			shArgs('git -c safe.directory=\'*\' -C "$1" ls-files -z --cached --others --exclude-standard', root),
 			opOpts(),
 		);
+		// Not a repo / git missing: fall back to the walk. A dead sandbox: throw.
+		throwIfSandboxUnavailable(t, r);
 		if (r.exitCode !== 0) return null;
 		const files: string[] = [];
 		for (const relative of r.stdout.toString("utf8").split("\0")) {
 			if (relative) files.push(path.join(root, relative));
 		}
 		return files;
-	} catch {
+	} catch (err) {
+		if (err instanceof SandboxUnavailableError) throw err;
 		return null;
 	}
 }
@@ -326,7 +359,8 @@ async function walkFiles(
 	let entries: Map<string, boolean>;
 	try {
 		entries = await listDirEntries(t, dir);
-	} catch {
+	} catch (err) {
+		if (err instanceof SandboxUnavailableError) throw err;
 		return true; // unreadable subtree: skip, like the built-in does
 	}
 	for (const [name, isDir] of entries) {
@@ -367,7 +401,8 @@ export async function executeSandboxGrep(
 		let content: string;
 		try {
 			content = (await readBytes(t, absolute)).toString("utf8");
-		} catch {
+		} catch (err) {
+			if (err instanceof SandboxUnavailableError) throw err;
 			return true; // binary/unreadable file
 		}
 		const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
@@ -490,6 +525,13 @@ export function createBashOps(t: ExecTransport, options: BashOpsOptions = {}): B
 				.filter(Boolean)
 				.join("\n");
 			const r = await t.exec(["sh", "-lc", script], { onData, signal, timeout });
+			// A non-zero exit here is usually the command's OWN status (grep found
+			// nothing, a test failed, `false`) and must stay an exit code. But when
+			// the signature says the VM never started, the command did not run at
+			// all — surface that instead of a bogus status, so the caller can
+			// invalidate the transport. bash is the most common way to hit a dead
+			// sandbox, so it must not be the one path that never recovers.
+			throwIfSandboxUnavailable(t, r);
 			return { exitCode: r.exitCode };
 		},
 	};

@@ -41,6 +41,7 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { armSessionLifecycle, debugEnabled, envAllowlist, teardownSandbox } from "../index.ts";
+import { SandboxUnavailableError } from "./failure.ts";
 import {
 	createBashOps,
 	createEditOps,
@@ -78,6 +79,55 @@ export default function (pi: ExtensionAPI) {
 	let transport: ExecTransport | undefined;
 	let starting: Promise<ExecTransport | undefined> | undefined;
 	let lastError: string | undefined;
+	/** Have we already told the user about the CURRENT run of runtime failures? */
+	let sandboxFailureReported = false;
+
+	/**
+	 * Forget the memoised transport so the next tool call re-resolves it.
+	 *
+	 * This is the whole recovery mechanism: `resolveTransport()` re-derives the
+	 * sandbox and (re)starts the VM, so a runtime failure is an episode rather
+	 * than a permanent bricking of every remaining tool call in the session.
+	 */
+	function invalidateTransport(): void {
+		transport = undefined;
+		starting = undefined;
+	}
+
+	/**
+	 * Run one sandbox round-trip, turning a dead sandbox into: invalidate +
+	 * notify (ONCE per episode) + rethrow.
+	 *
+	 * Deliberately NOT done here: retrying the command, or running it locally.
+	 * Re-running arbitrary work is unsafe (side effects), and the host is not the
+	 * execution environment — that would be a sandbox escape. The resolution-time
+	 * local fallback (see `ensureTransport`) is unchanged and only applies when no
+	 * transport can be resolved at all; it never triggers from here.
+	 */
+	async function withSandboxFailureHandling<T>(
+		ctx: ExtensionContext | undefined,
+		run: () => Promise<T>,
+	): Promise<T> {
+		try {
+			const result = await run();
+			sandboxFailureReported = false; // a success ends the episode
+			return result;
+		} catch (err) {
+			if (!(err instanceof SandboxUnavailableError)) throw err;
+			invalidateTransport();
+			if (!sandboxFailureReported) {
+				sandboxFailureReported = true;
+				ctx?.ui.notify(
+					`sbx sandbox "${err.target}" is unavailable — the sandbox runtime failed to start, so this tool ` +
+						`call did not run (it was NOT run on the host and was not retried). The next tool call will try ` +
+						`to start the sandbox again; if it keeps failing, the VM may need recreating (\`sbx ls\`, ` +
+						`then \`sbx stop ${err.target}\`).`,
+					"error",
+				);
+			}
+			throw err;
+		}
+	}
 
 	/**
 	 * Resolve (and memoize) the transport. Never throws: if sbx is missing or
@@ -129,7 +179,9 @@ export default function (pi: ExtensionAPI) {
 			async execute(id: unknown, params: unknown, signal: unknown, onUpdate: unknown, ctx?: ExtensionContext) {
 				const t = await ensureTransport(ctx);
 				if (!t) return (local.execute as Function)(id, params, signal, onUpdate, ctx);
-				return (build(t).execute as Function)(id, params, signal, onUpdate, ctx);
+				return withSandboxFailureHandling(ctx, () =>
+					(build(t).execute as Function)(id, params, signal, onUpdate, ctx),
+				);
 			},
 		} as T;
 	}
@@ -205,7 +257,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(id, params, signal, onUpdate, ctx) {
 			const t = await ensureTransport(ctx);
 			if (!t) return localGrep.execute(id, params, signal, onUpdate, ctx);
-			return executeSandboxGrep(t, localCwd, params as GrepToolInput);
+			return withSandboxFailureHandling(ctx, () => executeSandboxGrep(t, localCwd, params as GrepToolInput));
 		},
 	});
 
