@@ -184,6 +184,11 @@ persistent name (e.g. a shared sandbox reused across restarts), pin
 - `DOCKER_SANDBOX_TEMPLATE=<name>` — use a pre-baked `sbx template` for
   auto-created sandboxes (avoids re-pulling common images every session;
   create with `sbx template save <name>` from a prepared sandbox).
+- `DOCKER_SANDBOX_DEBUG=1` — emit the extension's lifecycle/GC diagnostics
+  (watchdog armed, teardown, startup sweep) to stderr. **Off by default**: the
+  extension runs inside the pi process, so stray console output would land on
+  the same terminal the TUI is drawing and corrupt the chat. Turn it on when
+  running `pi -p`, in a plain shell, or when diagnosing lifecycle issues.
 
 ## Ports (verified rules)
 

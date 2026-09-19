@@ -124,9 +124,9 @@ async function teardownSandbox(reason: string): Promise<void> {
 		].join("\n");
 		const child = spawn("/bin/sh", ["-c", script], { detached: true, stdio: "ignore", env: scrubbedEnv() });
 		child.unref();
-		console.error(`[docker-sandbox] session ${reason}: ${action} sandbox "${name}" (detached, retrying)`);
+		note(`session ${reason}: ${action} sandbox "${name}" (detached, retrying)`);
 	} catch (e) {
-		console.error(`[docker-sandbox] session ${reason}: teardown of "${name}" failed: ${(e as Error).message}`);
+		note(`session ${reason}: teardown of "${name}" failed: ${(e as Error).message}`);
 	}
 }
 
@@ -139,6 +139,22 @@ function findSbxCli(): string {
 		}
 	}
 	return "sbx";
+}
+
+/**
+ * Diagnostics are OFF by default on purpose: the extension runs inside the pi
+ * process, so a raw console write lands on the terminal the TUI is drawing and
+ * corrupts the chat transcript. Set DOCKER_SANDBOX_DEBUG=1 (or SBX_PI_DEBUG=1 /
+ * SBX_DEBUG=1) to get the lifecycle/GC lines on stderr — useful in `pi -p`, a
+ * plain shell or when diagnosing, harmless in the TUI because it is opt-in.
+ */
+function debugEnabled(): boolean {
+	return /^(1|true|yes|on)$/i.test((env.DOCKER_SANDBOX_DEBUG ?? env.SBX_PI_DEBUG ?? env.SBX_DEBUG ?? "").trim());
+}
+
+/** Diagnostic line — silent unless debug logging is enabled (see debugEnabled). */
+function note(message: string): void {
+	if (debugEnabled()) console.error(`[docker-sandbox] ${message}`);
 }
 
 /**
@@ -1486,9 +1502,9 @@ function spawnWatchdog(): void {
 	try {
 		const child = spawn("/bin/sh", ["-c", script], { detached: true, stdio: "ignore", env: scrubbedEnv() });
 		child.unref();
-		console.error(`[docker-sandbox] watchdog armed for sandbox "${name}" (pid ${pid}, teardown=${mode}, keepalive=${keep})`);
+		note(`watchdog armed for sandbox "${name}" (pid ${pid}, teardown=${mode}, keepalive=${keep})`);
 	} catch (e) {
-		console.error(`[docker-sandbox] failed to arm watchdog: ${(e as Error).message}`);
+		note(`failed to arm watchdog: ${(e as Error).message}`);
 	}
 }
 
@@ -1670,8 +1686,8 @@ async function armSessionLifecycle(): Promise<void> {
 	// sandboxes from crashed sessions, and session start must not wait on
 	// `sbx ls` (and any sandboxd round trip) to get there.
 	void gcSweep(raw)
-		.then((summary) => console.error(`[docker-sandbox] ${summary}`))
-		.catch((e) => console.error(`[docker-sandbox] gc at startup failed: ${(e as Error).message}`));
+		.then((summary) => note(summary))
+		.catch((e) => note(`gc at startup failed: ${(e as Error).message}`));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1973,4 +1989,5 @@ export {
 	ensureSandbox,
 	teardownSandbox,
 	armSessionLifecycle,
+	debugEnabled,
 };

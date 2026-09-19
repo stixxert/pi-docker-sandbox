@@ -375,6 +375,7 @@ try {
 	process.env.DOCKER_SANDBOX_KEEPALIVE = "1";
 	process.env.DOCKER_SANDBOX_TEARDOWN = "none"; // no stray teardown attempt
 	process.env.DOCKER_SANDBOX_GC_HOURS = "0"; // skip the startup sweep
+	process.env.DOCKER_SANDBOX_DEBUG = "1"; // lifecycle notes are debug-gated (silent in the TUI by default)
 	const { armSessionLifecycle } = await loadTs("index.ts");
 	const lifecycleLog = [];
 	const realError = console.error;
@@ -389,6 +390,7 @@ try {
 	);
 	delete process.env.DOCKER_SANDBOX_TEARDOWN;
 	delete process.env.DOCKER_SANDBOX_GC_HOURS;
+	delete process.env.DOCKER_SANDBOX_DEBUG;
 
 	/* --- lightweight template handshake -------------------------------- */
 	console.log("\nlightweight template handshake");

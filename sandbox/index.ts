@@ -40,7 +40,7 @@ import {
 	createReadToolDefinition,
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { armSessionLifecycle, envAllowlist, teardownSandbox } from "../index.ts";
+import { armSessionLifecycle, debugEnabled, envAllowlist, teardownSandbox } from "../index.ts";
 import {
 	createBashOps,
 	createEditOps,
@@ -157,7 +157,10 @@ export default function (pi: ExtensionAPI) {
 		void ensureTransport(ctx)
 			.then((active) => (active?.kind === "sbx" ? armSessionLifecycle() : undefined))
 			.catch((err) => {
-				console.error(`[sbx] session start failed: ${err instanceof Error ? err.message : String(err)}`);
+				// Raw console writes land on the terminal the TUI is drawing, so cap
+				// the failure note behind the debug flag — the backend degrades to
+				// local tools either way (the `sbx` command reports live status).
+				if (debugEnabled()) console.error(`[sbx] session start failed: ${err instanceof Error ? err.message : String(err)}`);
 			});
 	});
 
