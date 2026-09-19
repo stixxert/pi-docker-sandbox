@@ -44,6 +44,7 @@ import path from "node:path";
 import fs from "node:fs";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@earendil-works/pi-ai";
+import { claimLifecycleOwnership } from "./sandbox/session-scope.ts";
 
 // Host pi cwd is the root that the agent's VM mounts at /workspace.
 const hostRoot = process.cwd();
@@ -1691,9 +1692,15 @@ async function armSessionLifecycle(): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
+	// The sandbox execution backend (`sandbox/`) shares this lifecycle, and the
+	// auto-discovered `sbx-backend` bridge loads that backend into subagent
+	// sessions so their built-in tools run in the same sandbox. Only the
+	// top-level session — the first to load either entry — may tear it down.
+	const ownsLifecycle = claimLifecycleOwnership();
 	// Lifecycle: tear down this session's sandbox when the session ends
 	// (exit / Ctrl+C / Ctrl+D / SIGHUP / SIGTERM, /new, /resume, /fork).
 	pi.on("session_shutdown", async () => {
+		if (!ownsLifecycle) return;
 		await teardownSandbox("session_shutdown");
 	});
 

@@ -29,6 +29,7 @@
  *   DOCKER_SANDBOX / DOCKER_SANDBOX_*                see the docker_* extension
  */
 
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type GrepToolInput,
@@ -58,8 +59,15 @@ import {
 	executeSandboxGrep,
 } from "./operations.ts";
 import { type ExecTransport, defaultProjectSandbox, resolveTransport } from "./transport.ts";
+import { claimLifecycleOwnership } from "./session-scope.ts";
 
 export default function (pi: ExtensionAPI) {
+	// Subagent sessions (pi-subagents) load this router too, through the
+	// auto-discovered `sbx-backend` bridge, so a subagent's built-in tools run in
+	// the same sandbox as the main agent's instead of on the host. Only the
+	// top-level session may tear the shared (per-process) sandbox down; child
+	// sessions share it.
+	const ownsLifecycle = claimLifecycleOwnership();
 	const localCwd = process.cwd();
 
 	// Settle the sandbox NAME synchronously, before any session event can compute
@@ -209,6 +217,30 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * The working directory a session's routed tools must operate in.
+	 *
+	 * The backend mounts the process working directory (`localCwd`) into the
+	 * sandbox, while pi builds a session's tools with that SESSION's cwd. They
+	 * coincide for the top-level session, but not necessarily for a subagent — a
+	 * pi-subagents git worktree lives under the host tmpdir, outside the mount.
+	 * Routing now happens for subagents too, so the cwd is resolved per call: a
+	 * directory inside the mount is used as-is, one outside it is refused rather
+	 * than silently executed against (or written to) the wrong tree.
+	 */
+	function sessionCwd(ctx?: ExtensionContext): string {
+		const cwd = ctx?.cwd;
+		if (!cwd || cwd === localCwd) return localCwd;
+		const rel = path.relative(localCwd, cwd);
+		if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) return cwd;
+		throw new Error(
+			`sbx sandbox mounts only ${localCwd}, but this session's working directory is ${cwd}. ` +
+				`Its tools cannot be routed into the sandbox; nothing was executed. ` +
+				`Do not use worktree isolation (\`isolation: "worktree"\`) under the sbx backend, ` +
+				`or re-run the session without it.`,
+		);
+	}
+
+	/**
 	 * Route a tool to the sandbox, refusing to run it on the host when no sandbox
 	 * can be had (fail closed) unless the user opted in.
 	 *
@@ -217,18 +249,21 @@ export default function (pi: ExtensionAPI) {
 	 */
 	function routed<T extends { execute: (...args: never[]) => unknown }>(
 		local: T,
-		build: (t: ExecTransport) => T,
+		build: (t: ExecTransport, cwd: string) => T,
 	): T {
 		return {
 			...local,
 			async execute(id: unknown, params: unknown, signal: unknown, onUpdate: unknown, ctx?: ExtensionContext) {
+				// Resolved before the transport: an unroutable cwd must fail closed
+				// whether or not a sandbox happens to be available.
+				const cwd = sessionCwd(ctx);
 				const t = await ensureTransport(ctx);
 				if (!t) {
 					assertLocalFallbackAllowed();
 					return (local.execute as Function)(id, params, signal, onUpdate, ctx);
 				}
 				return withSandboxFailureHandling(ctx, () =>
-					(build(t).execute as Function)(id, params, signal, onUpdate, ctx),
+					(build(t, cwd).execute as Function)(id, params, signal, onUpdate, ctx),
 				);
 			},
 		} as T;
@@ -266,6 +301,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		// Child (subagent) sessions share the parent's per-process sandbox;
+		// tearing it down from one would kill the VM out from under the parent.
+		if (!ownsLifecycle) return;
 		// Only an sbx sandbox is ours to reclaim; a container backend is a
 		// caller-supplied environment (docker_* owns its own sandbox lifecycle).
 		if (transport?.kind === "sbx") await teardownSandbox("session_shutdown");
@@ -295,12 +333,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool(routed(localRead, (t) => createReadToolDefinition(localCwd, { operations: createReadOps(t) })));
-	pi.registerTool(routed(localWrite, (t) => createWriteToolDefinition(localCwd, { operations: createWriteOps(t) })));
-	pi.registerTool(routed(localEdit, (t) => createEditToolDefinition(localCwd, { operations: createEditOps(t) })));
-	pi.registerTool(routed(localBash, (t) => createBashToolDefinition(localCwd, { operations: createBashOps(t, { allowEnv: bashAllowEnv }) })));
-	pi.registerTool(routed(localLs, (t) => createLsToolDefinition(localCwd, { operations: createLsOps(t) })));
-	pi.registerTool(routed(localFind, (t) => createFindToolDefinition(localCwd, { operations: createFindOps(t) })));
+	pi.registerTool(routed(localRead, (t, cwd) => createReadToolDefinition(cwd, { operations: createReadOps(t) })));
+	pi.registerTool(routed(localWrite, (t, cwd) => createWriteToolDefinition(cwd, { operations: createWriteOps(t) })));
+	pi.registerTool(routed(localEdit, (t, cwd) => createEditToolDefinition(cwd, { operations: createEditOps(t) })));
+	pi.registerTool(routed(localBash, (t, cwd) => createBashToolDefinition(cwd, { operations: createBashOps(t, { allowEnv: bashAllowEnv }) })));
+	pi.registerTool(routed(localLs, (t, cwd) => createLsToolDefinition(cwd, { operations: createLsOps(t) })));
+	pi.registerTool(routed(localFind, (t, cwd) => createFindToolDefinition(cwd, { operations: createFindOps(t) })));
 	// grep is replaced wholesale, not merely re-pointed: pi's grep tool spawns
 	// host ripgrep for match discovery regardless of custom operations, which
 	// would scan the host filesystem and require rg on the host. The sandbox
@@ -308,12 +346,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		...localGrep,
 		async execute(id, params, signal, onUpdate, ctx) {
+			const cwd = sessionCwd(ctx);
 			const t = await ensureTransport(ctx);
 			if (!t) {
 				assertLocalFallbackAllowed();
 				return localGrep.execute(id, params, signal, onUpdate, ctx);
 			}
-			return withSandboxFailureHandling(ctx, () => executeSandboxGrep(t, localCwd, params as GrepToolInput));
+			return withSandboxFailureHandling(ctx, () => executeSandboxGrep(t, cwd, params as GrepToolInput));
 		},
 	});
 
