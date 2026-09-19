@@ -111,6 +111,91 @@ export class SandboxUnavailableError extends Error {
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/* fail-closed policy when NO sandbox can be resolved at all           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The opt-in that permits running tools directly on the HOST when no sandbox
+ * can be resolved.
+ *
+ * The default is to REFUSE (fail closed): an unresolvable sandbox must never
+ * mean "silently run on the host" — that is a sandbox escape, and the host is
+ * not the execution environment. Named with the repo's own `DOCKER_SANDBOX_*`
+ * prefix and deliberately NOT tied to any launcher (e.g. pidock's separate
+ * `PIDOCK_ALLOW_UNSANDBOXED`), so the backend stays usable standalone.
+ */
+export const UNSANDBOXED_OPT_IN_ENV = "DOCKER_SANDBOX_ALLOW_UNSANDBOXED";
+
+/**
+ * True when the user has explicitly opted into unsandboxed operation via
+ * `UNSANDBOXED_OPT_IN_ENV`.
+ *
+ * Accepts `1`, `true`, `yes`, `on` (case-insensitive, surrounding whitespace
+ * ignored) — the same boolean vocabulary as the repo's other knobs
+ * (`DOCKER_SANDBOX_DEBUG`, `DOCKER_SANDBOX_ENV_PASSTHROUGH`, ...). Anything
+ * else, including unset and `0`/`false`/`no`/`off`, leaves the secure default:
+ * refuse.
+ */
+export function unsandboxedAllowed(env: Readonly<Record<string, string | undefined>>): boolean {
+	return /^(1|true|yes|on)$/i.test((env[UNSANDBOXED_OPT_IN_ENV] ?? "").trim());
+}
+
+/**
+ * The typed error for a tool call REFUSED because no sandbox could be resolved
+ * and the host fallback is disabled.
+ *
+ * Distinct from `SandboxUnavailableError`: that one is a sandbox that existed
+ * and failed mid-round-trip (transient — the next call re-resolves and may
+ * recover). This one means there was never a sandbox to fail in, and the
+ * fail-closed policy has refused to run the tool anywhere. It is actionable,
+ * not a stack trace: it names the cause, states in as many words that the
+ * command was NOT run on the host, and names the exact variable that would opt
+ * into unsandboxed operation.
+ */
+export class SandboxRequiredError extends Error {
+	/** The resolution failure that led here (may be empty). */
+	readonly failure: string;
+
+	constructor(failure?: string) {
+		const detail = (failure ?? "").trim();
+		super(
+			`sbx sandbox unavailable: ${
+				detail ||
+				"no sandbox transport could be resolved (is the `sbx` CLI installed and the VM runnable?)"
+			}.\n` +
+				`This tool was NOT run: it did not execute in the sandbox, and it was NOT run on the host either.\n` +
+				`Refusing to run unsandboxed by default. To allow tools to run directly on the host instead, set ` +
+				`${UNSANDBOXED_OPT_IN_ENV}=1 and retry.`,
+		);
+		this.name = "SandboxRequiredError";
+		this.failure = detail;
+	}
+}
+
+/**
+ * The fail-closed policy for a resolution failure: from an environment snapshot
+ * plus the resolution failure, decide whether the caller may fall back to the
+ * LOCAL (host) tool or must refuse.
+ *
+ * `{ allow: true }` only when the user has explicitly opted in with
+ * `DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1` (see `unsandboxedAllowed`). Otherwise the
+ * decision carries a `SandboxRequiredError` whose message names the cause, says
+ * the command was not run on the host, and names the opt-in variable.
+ *
+ * Pure and dependency-free (like the rest of this module) so the policy can be
+ * unit-tested without the pi packages.
+ */
+export type LocalFallbackDecision = { allow: true } | { allow: false; error: SandboxRequiredError };
+
+export function decideLocalFallback(
+	env: Readonly<Record<string, string | undefined>>,
+	failure?: string,
+): LocalFallbackDecision {
+	if (unsandboxedAllowed(env)) return { allow: true };
+	return { allow: false, error: new SandboxRequiredError(failure) };
+}
+
 /**
  * Per-episode state for the runtime-failure notification.
  *

@@ -41,7 +41,13 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { armSessionLifecycle, debugEnabled, envAllowlist, teardownSandbox } from "../index.ts";
-import { SandboxFailureEpisode, SandboxUnavailableError } from "./failure.ts";
+import {
+	SandboxFailureEpisode,
+	SandboxUnavailableError,
+	UNSANDBOXED_OPT_IN_ENV,
+	decideLocalFallback,
+	unsandboxedAllowed,
+} from "./failure.ts";
 import {
 	createBashOps,
 	createEditOps,
@@ -106,6 +112,20 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * The fail-closed gate for "there is no transport at all".
+	 *
+	 * Returns normally ONLY when the user has explicitly opted into unsandboxed
+	 * operation (`DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1`); otherwise throws the
+	 * typed `SandboxRequiredError`, so the tool call is REFUSED instead of being
+	 * silently executed on the host. The decision itself lives in `failure.ts`,
+	 * which is import-free and unit-tested.
+	 */
+	function assertLocalFallbackAllowed(): void {
+		const decision = decideLocalFallback(process.env, lastError);
+		if (decision.allow === false) throw decision.error;
+	}
+
+	/**
 	 * Run one sandbox round-trip, turning a dead sandbox into: invalidate +
 	 * notify (ONCE per episode) + rethrow.
 	 *
@@ -144,10 +164,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Resolve (and memoize) the transport. Never throws: if sbx is missing or
-	 * the sandbox cannot be provisioned, pi keeps working with its LOCAL tools
-	 * and the degradation is reported — both to the user and in the system
-	 * prompt, so the agent never believes it is sandboxed when it is not.
+	 * Resolve (and memoize) the transport. Never throws: if sbx is missing or the
+	 * sandbox cannot be provisioned, `undefined` is returned and the degradation
+	 * is reported — both to the user and in the system prompt. The CALLER of a
+	 * tool call then decides what to do (see `assertLocalFallbackAllowed`): by
+	 * default it REFUSES, so the host is never silently used as the execution
+	 * environment; only an explicit `DOCKER_SANDBOX_ALLOW_UNSANDBOXED=1` opt-in
+	 * permits the local fallback.
 	 */
 	async function ensureTransport(ctx?: ExtensionContext): Promise<ExecTransport | undefined> {
 		if (transport) return transport;
@@ -169,7 +192,13 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					lastError = err instanceof Error ? err.message : String(err);
 					ctx?.ui.setStatus("sbx", ctx.ui.theme.fg("error", "sbx: unavailable"));
-					ctx?.ui.notify(`sbx backend unavailable — running tools locally.\n${lastError}`, "warning");
+					ctx?.ui.notify(
+						unsandboxedAllowed(process.env)
+							? `sbx backend unavailable — ${UNSANDBOXED_OPT_IN_ENV}=1, so tools run directly on the host.\n${lastError}`
+							: `sbx backend unavailable — refusing tool calls; nothing will run on the host.\n` +
+									`Set ${UNSANDBOXED_OPT_IN_ENV}=1 to run tools directly on the host instead.\n${lastError}`,
+						"warning",
+					);
 					return undefined;
 				} finally {
 					starting = undefined;
@@ -180,7 +209,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Route a tool to the sandbox, falling back to the local tool on failure.
+	 * Route a tool to the sandbox, refusing to run it on the host when no sandbox
+	 * can be had (fail closed) unless the user opted in.
+	 *
 	 * `ctx` is forwarded — the built-ins use it to inject PI_* session metadata
 	 * into the bash environment, and dropping it would silently change behaviour.
 	 */
@@ -192,7 +223,10 @@ export default function (pi: ExtensionAPI) {
 			...local,
 			async execute(id: unknown, params: unknown, signal: unknown, onUpdate: unknown, ctx?: ExtensionContext) {
 				const t = await ensureTransport(ctx);
-				if (!t) return (local.execute as Function)(id, params, signal, onUpdate, ctx);
+				if (!t) {
+					assertLocalFallbackAllowed();
+					return (local.execute as Function)(id, params, signal, onUpdate, ctx);
+				}
 				return withSandboxFailureHandling(ctx, () =>
 					(build(t).execute as Function)(id, params, signal, onUpdate, ctx),
 				);
@@ -224,8 +258,9 @@ export default function (pi: ExtensionAPI) {
 			.then((active) => (active?.kind === "sbx" ? armSessionLifecycle() : undefined))
 			.catch((err) => {
 				// Raw console writes land on the terminal the TUI is drawing, so cap
-				// the failure note behind the debug flag — the backend degrades to
-				// local tools either way (the `sbx` command reports live status).
+				// the failure note behind the debug flag — tool calls refuse by default
+				// or run on the host only under the explicit opt-in (the `sbx` command
+				// reports live status).
 				if (debugEnabled()) console.error(`[sbx] session start failed: ${err instanceof Error ? err.message : String(err)}`);
 			});
 	});
@@ -250,7 +285,11 @@ export default function (pi: ExtensionAPI) {
 							"",
 							"Tools routed into the sandbox: bash, read, write, edit, grep, find, ls",
 						].join("\n")
-					: `sbx backend unavailable — tools run locally.\n${lastError ?? ""}`,
+					: `sbx backend unavailable — ${
+							unsandboxedAllowed(process.env)
+								? `tools run directly on the host (${UNSANDBOXED_OPT_IN_ENV}=1)`
+								: `tool calls are refused; nothing runs on the host (set ${UNSANDBOXED_OPT_IN_ENV}=1 to allow unsandboxed execution)`
+						}.\n${lastError ?? ""}`,
 				t ? "info" : "warning",
 			);
 		},
@@ -270,26 +309,45 @@ export default function (pi: ExtensionAPI) {
 		...localGrep,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const t = await ensureTransport(ctx);
-			if (!t) return localGrep.execute(id, params, signal, onUpdate, ctx);
+			if (!t) {
+				assertLocalFallbackAllowed();
+				return localGrep.execute(id, params, signal, onUpdate, ctx);
+			}
 			return withSandboxFailureHandling(ctx, () => executeSandboxGrep(t, localCwd, params as GrepToolInput));
 		},
 	});
 
 	// The user's own `!` commands belong in the sandbox too, exactly as gondolin
-	// routes them — otherwise `!` would silently execute on the host.
+	// routes them — otherwise `!` would silently execute on the host. When no
+	// sandbox can be had, the same fail-closed policy applies: refuse (throw)
+	// unless the user opted into unsandboxed operation.
 	pi.on("user_bash", async (_event, ctx) => {
 		const t = await ensureTransport(ctx);
-		if (!t) return undefined;
+		if (!t) {
+			assertLocalFallbackAllowed();
+			return undefined; // opt-in set: run on the host, as explicitly requested
+		}
 		return { operations: createBashOps(t, { allowEnv: bashAllowEnv }) };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const t = await ensureTransport(ctx);
 		const localLine = `Current working directory: ${localCwd}`;
-		const replacement = t
-			? `Current working directory: ${localCwd} — commands run inside the ${t.kind} sandbox "${t.target}" ` +
-				`(the same absolute paths exist there; the host is not the execution environment)`
-			: `${localLine} (WARNING: the sbx sandbox is unavailable, so commands run directly on the host)`;
+		let replacement: string;
+		if (t) {
+			replacement =
+				`Current working directory: ${localCwd} — commands run inside the ${t.kind} sandbox "${t.target}" ` +
+				`(the same absolute paths exist there; the host is not the execution environment)`;
+		} else if (unsandboxedAllowed(process.env)) {
+			replacement =
+				`${localLine} (WARNING: the sbx sandbox is unavailable and ${UNSANDBOXED_OPT_IN_ENV} is set, ` +
+				`so commands run directly on the host — not in the sandbox)`;
+		} else {
+			replacement =
+				`${localLine} (WARNING: the sbx sandbox is unavailable and ${UNSANDBOXED_OPT_IN_ENV} is not set, ` +
+				`so tool calls are REFUSED and will NOT run — neither in the sandbox nor on the host. ` +
+				`Set ${UNSANDBOXED_OPT_IN_ENV}=1 to run tools directly on the host instead.)`;
+		}
 		const systemPrompt = event.systemPrompt.includes(localLine)
 			? event.systemPrompt.replace(localLine, replacement)
 			: `${event.systemPrompt}\n\n${replacement}`;
