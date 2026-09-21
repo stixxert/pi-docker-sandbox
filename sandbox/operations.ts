@@ -40,6 +40,7 @@ import type {
 	ReadOperations,
 	WriteOperations,
 } from "@earendil-works/pi-coding-agent";
+import { chunkFiles, readManyBytes } from "./batch-read.ts";
 import { SandboxUnavailableError, isSandboxUnavailableFailure } from "./failure.ts";
 import { type ExecOptions, type ExecOutcome, type ExecTransport, shArgs, shQuote } from "./transport.ts";
 
@@ -85,9 +86,15 @@ function opOpts(extra?: ExecOptions): ExecOptions {
  * status when the VM was reachable, and the CLI's own failure when it was not.
  * This is the one place that ambiguity is resolved, so no call site below can
  * mistake "the whole sandbox is down" for "this file does not exist".
+ *
+ * The parameter is structural rather than the full `ExecOutcome` so a batched
+ * read's outcome (see `batch-read.ts`) can be checked by the same rule.
  */
-function throwIfSandboxUnavailable(t: ExecTransport, r: ExecOutcome): void {
-	if (isSandboxUnavailableFailure(r)) throw new SandboxUnavailableError(t.target, r.stderr.toString("utf8"));
+function throwIfSandboxUnavailable(t: ExecTransport, r: { exitCode: number | null; stderr?: Uint8Array | string }): void {
+	if (!isSandboxUnavailableFailure(r)) return;
+	const stderr =
+		r.stderr === undefined || typeof r.stderr === "string" ? (r.stderr ?? "") : Buffer.from(r.stderr).toString("utf8");
+	throw new SandboxUnavailableError(t.target, stderr);
 }
 
 async function must(t: ExecTransport, argv: string[], fallback: string, opts?: ExecOptions): Promise<ExecOutcome> {
@@ -396,15 +403,10 @@ export async function executeSandboxGrep(
 	let limitReached = false;
 	let linesTruncated = false;
 
-	const visit = async (absolute: string, display: string): Promise<boolean> => {
-		if (params.glob && !matchesToolGlob(display, params.glob)) return true;
-		let content: string;
-		try {
-			content = (await readBytes(t, absolute)).toString("utf8");
-		} catch (err) {
-			if (err instanceof SandboxUnavailableError) throw err;
-			return true; // binary/unreadable file
-		}
+	// Match one file's already-buffered content and emit its lines. Split out from
+	// the enumeration so the SAME logic runs whether a file arrived via a batched
+	// read or a single one — the batching must not change a single output byte.
+	const matchContent = (display: string, content: string): boolean => {
 		const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
 		// Collect this file's matches first, so a line that is itself a match is
@@ -441,19 +443,45 @@ export async function executeSandboxGrep(
 		return !limitReached;
 	};
 
+	// Enumerate candidates first, applying the glob BEFORE any read (so a
+	// non-matching file is never fetched), then read them in bounded chunks:
+	// one `sbx exec` per chunk instead of one per file. Order is the enumeration
+	// order, so the emitted lines are byte-identical to the per-file path.
+	const candidates: Array<{ absolute: string; display: string }> = [];
 	if (!rootIsDir) {
-		await visit(root, path.basename(root));
+		const display = path.basename(root);
+		if (!params.glob || matchesToolGlob(display, params.glob)) candidates.push({ absolute: root, display });
 	} else {
 		// git enumeration honours .gitignore exactly (as this tool's description
 		// promises); a pruned walk is the fallback when git is unavailable.
-		const gitFiles = await gitSearchableFiles(t, root);
-		if (gitFiles) {
-			for (const absolute of gitFiles) {
-				const display = path.relative(root, absolute).split(path.sep).join("/");
-				if (!(await visit(absolute, display))) break;
-			}
-		} else {
-			await walkFiles(t, root, "", visit);
+		const files = (await gitSearchableFiles(t, root)) ?? (await walkSearchableFiles(t, root));
+		for (const absolute of files) {
+			const display = path.relative(root, absolute).split(path.sep).join("/");
+			if (params.glob && !matchesToolGlob(display, params.glob)) continue;
+			candidates.push({ absolute, display });
+		}
+	}
+
+	const displayByPath = new Map(candidates.map(({ absolute, display }) => [absolute, display]));
+	for (const chunk of chunkFiles(candidates.map(({ absolute }) => absolute))) {
+		if (limitReached) break; // later chunks cannot contribute
+		let contents: Map<string, Buffer>;
+		try {
+			contents = await readManyBytes(t, chunk, {
+				timeout: DEFAULT_OP_TIMEOUT,
+				// A dead sandbox must not be mistaken for "these files are unreadable":
+				// surface it. Only ordinary read failures are skipped (absent from the
+				// map), exactly like the per-file catch-and-continue this replaced.
+				onChunkFailure: (outcome) => throwIfSandboxUnavailable(t, outcome),
+			});
+		} catch (err) {
+			if (err instanceof SandboxUnavailableError) throw err;
+			continue; // transport hiccup: the whole chunk is unreadable, as one file was before
+		}
+		for (const absolute of chunk) {
+			const content = contents.get(absolute);
+			if (content === undefined) continue; // binary/unreadable file
+			if (!matchContent(displayByPath.get(absolute) ?? absolute, content.toString("utf8"))) break;
 		}
 	}
 

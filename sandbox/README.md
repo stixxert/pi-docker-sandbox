@@ -66,6 +66,30 @@ giving it sandbox operations would scan the *host* filesystem and require
 `rg` on the host. The tool is replaced wholesale by a walk-and-match over
 the transport, so matches come from sandbox content.
 
+**grep reads files in batches, not one exec per file.** Every `sbx exec` is a
+round-trip costing ≈0.5 s, so reading one file per exec dominated the tool:
+a grep over ~170 candidates cost ~173 round-trips. `batch-read.ts` frames
+readable files as `<path>\0<base64(body)>\0` (NUL-delimited, never newline —
+`git ls-files -z` paths may contain newlines) and reads them with ONE exec per
+chunk of ≤256 files / ≤96 KiB of paths, bounded so argv stays well under
+`ARG_MAX`. The per-file matching logic is unchanged and the candidate order is
+preserved, so the output is byte-identical; grep latency for that same ~170-file
+case drops from ~173 round-trips to 4 (the fixed `exists` + `isDirectory` +
+`git ls-files` plus one read chunk).
+
+**A transient sandbox-start failure is retried, briefly.** `sbx exec` can fail
+because the VM has not finished starting rather than because the command
+failed. Two measured causes are transient — the concurrent-start race (the
+loser of a race to bring one per-project VM up sees `409 ... port is already
+allocated`) and a `5xx` from sandboxd's runtime API. On the sbx transport only,
+a failed exec is retried at most twice (after 250 ms and 1000 ms) while the
+sandbox is cold, and only when `isRuntimeNeverStarted` proves the runtime never
+came up — i.e. the command provably did not run, so a retry cannot duplicate a
+side effect. A genuinely dead sandbox still fails in ≈1.25 s. The *persistent*
+`409 ... port 127.0.0.1:8081/tcp is already published` conflict is NOT absorbed:
+a stored port mapping has to be cleared (or the VM stopped) first — the retry
+cannot fix it, and the bounded budget just keeps that failure fast.
+
 **`.gitignore` is honoured by using git itself.** `grep`/`find` enumerate
 with `git ls-files --cached --others --exclude-standard`, which is exactly
 "tracked plus untracked-but-not-ignored" — so build output (`dist/`,
@@ -258,6 +282,15 @@ project-scoped.
   listing format (the same trade-off the tools' text output already makes).
 - **`.gitignore` needs git.** Without git in the sandbox, only `.git` and
   `node_modules` are skipped. sbx images ship git, so this is the exception.
+- **grep buffers one chunk, not one file.** The batched read holds up to 256
+  files' contents in memory at once instead of one file at a time. For a repo
+  with very large candidates this raises peak memory (though the old path also
+  buffered a whole file's base64 per exec). The chunk bound is chosen for argv
+  size; lower `maxFiles` via `readManyBytes` if a project needs it.
+- **grep's walk fallback enumerates before reading.** When git is unavailable,
+  candidates are collected first and then read, so a small `limit` no longer
+  stops the directory walk early. Results are identical; the no-git path just
+  does a little more enumeration work.
 
 ## Tests
 
@@ -272,6 +305,14 @@ host hypervisor), which is exactly why the transport is pluggable: `npm run
 e2e` drives the identical ops layer against a real container via
 `docker exec`, and the only difference from the product path is which binary
 performs `exec <target> --`.
+
+The dependency-free modules — `failure.ts` (the runtime-failure classifier and
+the retry safety proof), `exec-retry.ts` (the bounded retry) and
+`batch-read.ts` (the batched grep reads) — are additionally unit-tested from the
+config repo that consumes this checkout, because they import nothing at all and
+therefore need neither pi nor a sandbox. `operations.ts` cannot be imported
+there (it imports pi's tool package), so its own behaviour is covered by
+`npm run e2e` instead.
 
 ## Relationship to the `docker_*` tools
 

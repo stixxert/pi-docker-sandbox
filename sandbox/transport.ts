@@ -26,6 +26,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureSandbox, findSbxCli, runSbxCli, scrubbedEnv } from "../index.ts";
+import { isRuntimeNeverStarted } from "./failure.ts";
+import { createRetryingExec } from "./exec-retry.ts";
 
 /* ------------------------------------------------------------------ */
 /* project-scoped sandbox naming                                       */
@@ -210,13 +212,39 @@ function spawnExec(bin: string, prefix: string[], argv: string[], opts: ExecOpti
 	});
 }
 
-/** `sbx exec <sandbox> -- ...` — the product path. */
+/**
+ * `sbx exec <sandbox> -- ...` — the product path.
+ *
+ * START-FAILURE RETRY — scope stated precisely, because the word "retry"
+ * invites over-claiming. This absorbs a **transient** start failure: the
+ * concurrent-start race (two callers racing to bring one per-project VM up, the
+ * loser seeing `409 ... port is already allocated`) and a `5xx` from sandboxd's
+ * runtime API. It is bounded to 2 retries (250 ms, 1000 ms) and gated on
+ * `isRuntimeNeverStarted`, so the command provably did not run and re-running it
+ * cannot duplicate a side effect. It runs ONLY while the transport is cold, so a
+ * healthy session pays nothing, and a genuinely dead VM still fails in ≈1.25 s.
+ *
+ * NOT absorbed: the PERSISTENT `409 ... port 127.0.0.1:8081/tcp is already
+ * published` conflict. That is a different 409 — a stored port mapping still
+ * holds the port and ~100 consecutive attempts were measured to fail with it.
+ * A retry cannot clear a stored mapping; the VM must be stopped or the mapping
+ * cleared (`sbx stop <name>`) before it can start. The bounded budget is what
+ * keeps that case a fast, honest failure instead of a long hang, but it is not
+ * a fix for it.
+ *
+ * Stream note: `spawnExec` forwards `opts.onData` for stdout AND stderr, so a
+ * first attempt that is discarded will already have streamed the CLI's own
+ * error line to the caller. That is cosmetic and deliberately not hidden —
+ * un-streaming is impossible anyway, and suppressing it would mean pretending
+ * the failed attempt never happened.
+ */
 export function createSbxTransport(sandboxName: string): ExecTransport {
 	const bin = findSbxCli();
+	const spawn = (argv: string[], opts?: ExecOptions) => spawnExec(bin, ["exec", sandboxName, "--"], argv, opts);
 	return {
 		kind: "sbx",
 		target: sandboxName,
-		exec: (argv, opts) => spawnExec(bin, ["exec", sandboxName, "--"], argv, opts),
+		exec: createRetryingExec({ run: spawn, shouldRetry: isRuntimeNeverStarted }),
 	};
 }
 

@@ -62,9 +62,30 @@ function asText(value: Uint8Array | string | undefined): string {
  * phrase like "request failed: 500" is far more likely to be a false match).
  * A signal kill (exitCode null — our own abort/timeout) is never classified.
  */
+
+/**
+ * `start runtime: request failed: <5xx>` — sandboxd's runtime API refusing the
+ * start with a server-side error. Named separately from the list because the
+ * retry predicate below must match this exact anchor, and duplicating the
+ * regex would let the two drift.
+ */
+const RUNTIME_REQUEST_FAILED_5XX = /start runtime: request failed:\s*5\d\d\b/i;
+
+/**
+ * `start runtime: request failed: 409` — sandboxd's runtime API refusing the
+ * start with a conflict (the measured "port is already allocated").
+ *
+ * Deliberately NOT added to `RUNTIME_FAILURE_SIGNATURES` below: a 409 arrives
+ * wrapped in `failed to start sandbox: start runtime: ...`, which that list's
+ * first signature already matches, so the general classifier needs no extra
+ * pattern. This constant exists for the STRICTER predicate — the retry safety
+ * proof — which refuses to trust the wrapper alone.
+ */
+const RUNTIME_REQUEST_FAILED_CONFLICT = /start runtime: request failed:\s*409\b/i;
+
 const RUNTIME_FAILURE_SIGNATURES: readonly RegExp[] = [
 	/failed to start sandbox:\s*start runtime:/i,
-	/start runtime: request failed:\s*5\d\d\b/i,
+	RUNTIME_REQUEST_FAILED_5XX,
 	/docker daemon failed to start inside the sandbox\b/i,
 ];
 
@@ -81,6 +102,46 @@ export function isSandboxUnavailableFailure(outcome: ExecLike): boolean {
 }
 
 /**
+ * The retry safety proof: true only when the runtime never came up, and so the
+ * command **provably did not run**.
+ *
+ * Retrying is only ever safe under that proof. `sbx exec` reports "the sandbox VM
+ * did not start" and "the command ran and exited non-zero" through the same
+ * channel (a non-zero exit plus stderr), so a naive retry of a failed exec could
+ * re-run a side-effecting command that already ran. This predicate is what
+ * separates the two — it matches ONLY sandboxd's own runtime-start rejection:
+ *
+ *  - `409` (the start was refused with a conflict) and `5\d\d` (the runtime API
+ *    errored server-side). Both happen BEFORE any VM or command exists, so no
+ *    part of the command can have executed yet.
+ *
+ * Everything else is excluded on purpose, because it does not prove the command
+ * was skipped:
+ *
+ *  - A bare `failed to start sandbox: start runtime:` wrapper with NO code — e.g.
+ *    a `404 sandbox not found`. The wrapper alone is a message shape a user's
+ *    own launcher could also print, and an unquoted failure tells us nothing
+ *    about whether the runtime placed the command.
+ *  - `docker daemon failed to start inside the sandbox` — here the VM DID start
+ *    and the failure is *inside* it, so the command may already have run. A
+ *    retry there would duplicate work, so this predicate must not match it even
+ *    though `isSandboxUnavailableFailure` does.
+ *  - `exitCode 0` (the command succeeded) and `exitCode null` (our own
+ *    abort/timeout — the command may be running or may already have run).
+ *
+ * Reuses the exact request-failed regexes above so the two classifiers cannot
+ * drift. Pure and dependency-free, like the rest of this module.
+ */
+export function isRuntimeNeverStarted(outcome: ExecLike): boolean {
+	if (outcome.exitCode === 0 || outcome.exitCode === null) return false;
+	const stderr = asText(outcome.stderr);
+	if (!stderr) return false;
+	return [RUNTIME_REQUEST_FAILED_CONFLICT, RUNTIME_REQUEST_FAILED_5XX].some((signature) =>
+		signature.test(stderr),
+	);
+}
+
+/**
  * The typed error for a dead sandbox runtime.
  *
  * Carries the sandbox target and the raw stderr, and its message names the
@@ -89,7 +150,9 @@ export function isSandboxUnavailableFailure(outcome: ExecLike): boolean {
  * and invalidates the memoised transport, so the NEXT tool call can start the
  * VM again. It is never a licence to retry the command or to fall back to the
  * host: re-running arbitrary work is unsafe, and the host is not the execution
- * environment.
+ * environment. (The transport may retry the *start* first, but only under
+ * `isRuntimeNeverStarted` — i.e. only when the command provably never ran, so
+ * by the time this error exists there is nothing to have re-run.)
  */
 export class SandboxUnavailableError extends Error {
 	readonly target: string;
